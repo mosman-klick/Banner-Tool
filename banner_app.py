@@ -726,24 +726,16 @@ async def _discover_ziflow_banners_async(proof_url: str, cookie_header: str = ""
             if (current_url.endswith("/public-token")
                     or "verify your identity" in body_text.lower()
                     or "already a user? sign in" in body_text.lower()):
-                already_tried_cookies = bool(cookies)
-                if already_tried_cookies:
-                    raise ZiflowAuthGateError(
-                        "Ziflow rejected the cookies you pasted (likely "
-                        "expired or wrong session). Re-copy your Cookie "
-                        "header from DevTools → Network → any ziflow.io "
-                        "request → Headers, paste it into the Cookie field, "
-                        "and try again.")
                 raise ZiflowAuthGateError(
                     "This Ziflow proof requires login (Klick's proofs are "
-                    "private). Three workarounds: (1) paste your Ziflow "
-                    "session Cookie into the Cookie field below — copy from "
-                    "DevTools → Network → any ziflow.io request → Headers → "
-                    "Cookie; (2) paste each banner's iframe-src URL "
+                    "private). Use the '📌 Banner Tool: Get from Ziflow' "
+                    "bookmarklet above — it runs in your logged-in browser "
+                    "tab and sends the banner URLs back here. Or, manually: "
+                    "paste each banner's iframe-src URL "
                     "(proof-assets.ziflow.io/.../richMedia/<guid>/index.html) "
-                    "newline-separated into the Staging URL field instead "
-                    "of the proof URL; (3) download the bundle from Ziflow "
-                    "and load it on the Storyboard tab via 'Load folder…'.")
+                    "newline-separated into the Staging URL field; or "
+                    "download the bundle from Ziflow and use "
+                    "'Storyboard → Load folder…'.")
 
             # Wait for the proof viewer to mount its outer iframe.
             await page.wait_for_selector(
@@ -4748,35 +4740,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     <!-- Loader card -->
     <div class="mb-loader">
-      <div class="row" style="margin-bottom:8px;">
-        <label style="flex:2;">Staging URL <span style="color:var(--text-muted);">(or paste many asset URLs, one per line)</span>
-          <textarea id="mb-url" rows="1"
-                    placeholder="https://klick.link-staging.com/... &#10;OR&#10;https://proof-assets.ziflow.io/Proofs/.../richMedia/.../index.html (one per line)"
-                    style="resize:vertical;min-height:34px;font-family:Menlo,monospace;font-size:12px;padding:8px 10px;border-radius:7px;border:1.5px solid var(--border-default);background:var(--bg-input);color:var(--text-primary);outline:none;"></textarea>
-        </label>
-        <label>Username <span style="color:var(--text-muted);">(optional)</span>
-          <input type="text" id="mb-user" placeholder="leave blank for Klick links">
-        </label>
-        <label>Password
-          <input type="password" id="mb-pass" placeholder="password">
-        </label>
-        <button class="btn btn-p btn-sm" onclick="mbLoad()" style="align-self:flex-end;">Load all banners</button>
-      </div>
-      <div class="row" style="margin-bottom:8px;">
-        <label style="flex:1;">Ziflow Cookie <span style="color:var(--text-muted);">(optional, only needed for private Klick proofs)</span>
-          <input type="text" id="mb-cookie"
-                 placeholder="paste your Ziflow Cookie header — DevTools → Network → any ziflow.io request → Headers → Cookie">
-        </label>
-      </div>
-      <p class="bc-status" id="mb-status"></p>
-
       <!-- ═══ Bookmarklet for private Klick Ziflow proofs ═══════════════════
-           One-time setup: drag this link to your bookmarks bar. Then on any
-           Ziflow proof page (where you're already logged in) click the
-           bookmark — it cycles through every banner, collects each iframe
-           src, and re-opens the Banner Tool with the URLs auto-filled.
-           No cookies, no DevTools, no manual paste. -->
-      <div style="margin-top:10px;padding:10px 12px;border:1.5px dashed var(--border-default);border-radius:8px;background:var(--bg-elevated);">
+           One-time setup: drag the purple button to your bookmarks bar.
+           Then on any Ziflow proof page (where you're already logged in)
+           click the bookmark — it cycles through every banner, collects
+           each iframe src, and re-opens the Banner Tool with the URLs
+           auto-filled. No DevTools, no manual paste. -->
+      <div style="padding:10px 12px;margin-bottom:10px;border:1.5px dashed var(--border-default);border-radius:8px;background:var(--bg-elevated);">
         <p style="margin:0 0 6px;font-size:11px;color:var(--text-secondary);letter-spacing:.04em;">
           🚀 ONE-CLICK ZIFLOW LOAD (Klick proofs)
         </p>
@@ -4794,6 +4764,22 @@ document.addEventListener('DOMContentLoaded', () => {
         </div>
       </div>
 
+      <div class="row" style="margin-bottom:8px;">
+        <label style="flex:1;">Staging URL <span style="color:var(--text-muted);">(or paste many asset URLs, one per line)</span>
+          <textarea id="mb-url" rows="1"
+                    placeholder="https://klick.link-staging.com/... &#10;OR&#10;https://proof-assets.ziflow.io/Proofs/.../richMedia/.../index.html (one per line)"
+                    style="resize:none;min-height:34px;font-family:Menlo,monospace;font-size:12px;padding:8px 10px;border-radius:7px;border:1.5px solid var(--border-default);background:var(--bg-input);color:var(--text-primary);outline:none;"></textarea>
+        </label>
+        <label style="flex:1;">Username <span style="color:var(--text-muted);">(optional)</span>
+          <input type="text" id="mb-user" placeholder="leave blank for Klick links">
+        </label>
+        <label style="flex:1;">Password
+          <input type="password" id="mb-pass" placeholder="password">
+        </label>
+        <button class="btn btn-p btn-sm" onclick="mbLoad()" style="align-self:flex-end;">Load all banners</button>
+      </div>
+      <p class="bc-status" id="mb-status"></p>
+
       <p class="hint" style="margin:8px 0 0;">
         <strong>Klick / AdPiler:</strong> use the password from the staging email — leave Username blank.<br>
         <strong>DoubleClick Studio</strong> (URLs starting with
@@ -4801,11 +4787,10 @@ document.addEventListener('DOMContentLoaded', () => {
         login needed; just paste the URL.<br>
         <strong>Ziflow proof</strong>: public proofs work directly. For
         <em>private</em> Klick proofs
-        (<code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>), the easiest way
-        is the <em>📌 Get from Ziflow</em> bookmarklet above. Or, manually:
-        (a) paste your Ziflow Cookie above, (b) paste each banner's
+        (<code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>) use the
+        <em>📌 Get from Ziflow</em> bookmarklet above, or paste each banner's
         <code>proof-assets.ziflow.io/.../richMedia/&lt;guid&gt;/index.html</code>
-        URL on a separate line, or (c) use <em>Storyboard → Load folder</em>.<br>
+        URL on a separate line, or use <em>Storyboard → Load folder</em>.<br>
         <strong>HTTP Basic Auth</strong>: fill both Username + Password fields.
       </p>
     </div>
@@ -6000,7 +5985,6 @@ async function mbLoad(){
   const url    = document.getElementById('mb-url').value.trim();
   const user   = document.getElementById('mb-user').value.trim();
   const pass   = document.getElementById('mb-pass').value;
-  const cookie = document.getElementById('mb-cookie').value.trim();
   if(!url){ mbStatus('Paste a staging / proof URL (or asset URLs) first.', 'err'); return; }
   mbStatus('Signing in + downloading banners…');
 
@@ -6012,7 +5996,7 @@ async function mbLoad(){
   try{
     const r = await busyFetch('/multi/load', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url, user, password: pass, cookie}),
+      body: JSON.stringify({url, user, password: pass}),
     }, 'Signing in + downloading banners…');
     d = await r.json();
   }catch(e){
