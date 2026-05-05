@@ -578,24 +578,40 @@ ZIFLOW_BANNER_IFRAME_SELECTOR = 'iframe[name^="ziflow-iframe-"]'
 ZIFLOW_NEXT_SELECTOR          = 'a[data-selector="asset-switcher-next"]'
 
 
+class ZiflowAuthGateError(Exception):
+    """Raised when a Ziflow proof URL hits the 'Verify your identity' gate.
+
+    Klick's proofs at klickhealth.ziflow.io require a logged-in Ziflow
+    session to view. Anonymous Playwright sessions get redirected to
+    `/public-token` and shown an email-verification form — magic-link based,
+    so we can't bypass it server-side. The Multi-Banner Viewer surfaces
+    this as a friendly error pointing the user at the new Load-folder flow.
+    """
+
+
 async def _discover_ziflow_banners_async(proof_url: str) -> list:
     """Drive a Ziflow proof SPA with Playwright to discover every banner.
 
     Returns a list of {name, url, creative_id} dicts shaped like the other
     discovery helpers so `_multi_load` can treat all sources uniformly.
 
+    Raises ZiflowAuthGateError if the proof requires login (Ziflow redirects
+    anonymous viewers to a `/public-token` identity-verification page).
+
     Algorithm:
     1. Open the proof URL.
-    2. Wait for the proof viewer's iframe to mount (its src is the current
+    2. Detect the public-token / "Verify your identity" auth gate. If
+       present, raise ZiflowAuthGateError.
+    3. Wait for the proof viewer's iframe to mount (its src is the current
        banner's index.html on proof-assets.ziflow.io).
-    3. Read the "1 of M" counter to get the total count (used as a safety
+    4. Read the "1 of M" counter to get the total count (used as a safety
        cap on the click loop).
-    4. Loop up to M times:
+    5. Loop up to M times:
        a. Read the iframe src → extract proof_guid + asset_guid.
        b. Append (de-duped) to the result list.
        c. If the "Next" chevron is disabled, stop.
        d. Click "Next" and wait for the iframe src to change.
-    5. Return the collected list.
+    6. Return the collected list.
     """
     from playwright.async_api import async_playwright
 
@@ -605,6 +621,21 @@ async def _discover_ziflow_banners_async(proof_url: str) -> list:
             ctx  = await browser.new_context(user_agent=_UA_HEADERS["User-Agent"])
             page = await ctx.new_page()
             await page.goto(proof_url, wait_until="domcontentloaded", timeout=45_000)
+            await page.wait_for_timeout(2_000)  # let SPA bootstrap
+
+            # Detect Ziflow's identity-verification gate (Klick proofs land here).
+            current_url = page.url
+            body_text = await page.evaluate("() => document.body && document.body.innerText || ''")
+            if (current_url.endswith("/public-token")
+                    or "verify your identity" in body_text.lower()
+                    or "already a user? sign in" in body_text.lower()):
+                raise ZiflowAuthGateError(
+                    "This Ziflow proof requires login (Klick's proofs are "
+                    "private). Workaround: download the bundle from Ziflow "
+                    "yourself, then load it on the Storyboard tab via "
+                    "'Load folder…' — or capture each banner one at a time "
+                    "via the Frame Capture tab using the proof's individual "
+                    "asset URLs.")
 
             # Wait for the proof viewer to mount the banner iframe.
             await page.wait_for_selector(
@@ -4552,8 +4583,11 @@ document.addEventListener('DOMContentLoaded', () => {
         login needed; just paste the URL and click Load. The app cycles
         through every creative in the size dropdown.<br>
         <strong>Ziflow proof</strong> (URLs like
-        <code>app.ziflow.io/proof/&lt;id&gt;</code>): no login needed; the app
-        finds every banner referenced on the proof page.<br>
+        <code>app.ziflow.io/proof/&lt;id&gt;</code>): the app finds every banner
+        on the proof page. Note: <em>private</em> Klick proofs (e.g.
+        <code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>) require login, which
+        the server can't do on your behalf — for those, download the bundle
+        from Ziflow and use <em>Storyboard → Load folder</em>.<br>
         <strong>HTTP Basic Auth</strong> (browser popup asks for user+pass):
         fill both fields.
       </p>
@@ -8073,6 +8107,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 with PLAYWRIGHT_SEM:
                     banners = asyncio.run(_discover_klick_banners(url, user, pwd))
+        except ZiflowAuthGateError as e:
+            # The proof page redirected us to Ziflow's identity-verification
+            # screen. Surface the helpful message verbatim — it tells the user
+            # exactly which fallback to use.
+            self._json({"ok": False, "error": str(e)}); return
         except Exception as e:
             err = str(e)
             if "401" in err or "Unauthorized" in err.lower():
