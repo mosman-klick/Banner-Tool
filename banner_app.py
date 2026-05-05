@@ -5120,22 +5120,31 @@ async function busyFetch(url, opts, msg){
 }
 
 // ── Save-As download helper ───────────────────────────────────────────────────
-// Wraps the modern File System Access API (showSaveFilePicker) so the user
-// gets a real "Save As" dialog where they pick the folder + filename. Falls
-// back to a regular download (browser default folder) on browsers without
-// support — Firefox + Safari today; Chromium-based browsers all have it.
+// Three-tier strategy so downloads work everywhere:
+//
+//   1. showSaveFilePicker() — true Save As dialog (Chromium browsers, top-level
+//      pages only). Lets the user pick folder + filename.
+//
+//   2. Blob URL + <a download> — Safari, Firefox, embedded contexts. We fetch
+//      the file ourselves, wrap the bytes in a blob, and let the browser
+//      handle the download. More reliable than passing a server URL to <a>
+//      because some browsers ignore download= on cross-context URLs.
+//
+//   3. Direct navigation — last-resort if even fetch fails. The server sets
+//      Content-Disposition: attachment so the browser will download.
 //
 // `extension` should include the leading dot (".zip", ".pdf"). MUST be called
-// from a user-gesture handler (button onclick) — browsers block the API
-// otherwise.
+// from a user-gesture handler (button onclick) — modern browsers block
+// programmatic downloads otherwise.
 async function downloadFile(url, suggestedName, mimeType, extension){
   mimeType = mimeType || 'application/octet-stream';
-  // Path 1: Save As dialog (modern Chromium browsers)
-  if (typeof window.showSaveFilePicker === 'function') {
+  const _toplevel = (window.self === window.top);
+
+  // Path 1: Save As dialog (Chromium-based browsers, top-level page only).
+  if (_toplevel && typeof window.showSaveFilePicker === 'function') {
     try {
       const opts = { suggestedName: suggestedName };
       if (extension) {
-        // The dialog's "Save as type" dropdown.
         opts.types = [{
           description: extension.replace(/^\./,'').toUpperCase() + ' file',
           accept: { [mimeType]: [extension] }
@@ -5143,27 +5152,54 @@ async function downloadFile(url, suggestedName, mimeType, extension){
       }
       const handle = await window.showSaveFilePicker(opts);
       setBusy('Downloading ' + suggestedName + '…');
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      if (!resp.ok) throw new Error('Server returned HTTP ' + resp.status);
+      const blob = await resp.blob();
       const writable = await handle.createWritable();
-      await resp.body.pipeTo(writable);
+      await writable.write(blob);
+      await writable.close();
       clearBusy();
       return true;
     } catch (e) {
       clearBusy();
       if (e && e.name === 'AbortError') return false;   // user cancelled
-      console.warn('Save dialog failed; falling back to direct link:', e);
-      // fall through to fallback
+      console.warn('showSaveFilePicker failed; falling back to blob link:', e);
+      // fall through to path 2
     }
   }
-  // Path 2: regular download (browser handles where to save)
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = suggestedName || '';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  return true;
+
+  // Path 2: Fetch as blob, then click an <a download>. Works in all browsers,
+  // sidesteps any issues with cross-context download attribute handling.
+  try {
+    setBusy('Downloading ' + suggestedName + '…');
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Server returned HTTP ' + resp.status);
+    const blob = await resp.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = suggestedName || '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    clearBusy();
+    return true;
+  } catch (e) {
+    clearBusy();
+    console.error('Blob download failed:', e);
+    // fall through to path 3
+  }
+
+  // Path 3: Last resort — navigate the browser to the URL. The server's
+  // Content-Disposition: attachment header still triggers a download.
+  try {
+    window.location.href = url;
+    return true;
+  } catch (e) {
+    alert('Download failed: ' + (e && e.message || e));
+    return false;
+  }
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────────
@@ -6156,19 +6192,29 @@ async function mbRunAll(){
       mbAppendLog(msg.text + '\n');
     } else if(msg.type === 'done'){
       mbAppendLog('\n✓ All banners captured.\n');
-      // Hosted: surface a download button that opens a Save-As dialog.
+      // Hosted: surface a prominent download button. Replace the runstatus
+      // text with a button so it's the focal point of the screen — the inline
+      // log button was easy to miss. Also add a copy in the log for redundancy.
+      const rs = document.getElementById('mb-runstatus');
       if(msg.zip){
         const zname = msg.zip.split('/').pop();
         const url   = '/download/' + encodeURIComponent(zname);
-        mbAppendLog('Bundle zip ready — ');
+        // Prominent runstatus button.
+        rs.innerHTML = '';
+        const head = document.createElement('span');
+        head.textContent = 'Complete ✓ — ';
+        head.style.cssText = 'color:var(--accent-success);font-weight:600;margin-right:8px;';
+        rs.appendChild(head);
         const btn = document.createElement('button');
         btn.className = 'btn btn-p btn-sm';
-        btn.textContent = '⬇ Save zip as… (' + zname + ')';
+        btn.textContent = '⬇ Download zip (' + zname + ')';
         btn.onclick = () => downloadFile(url, zname, 'application/zip', '.zip');
-        document.getElementById('mb-log').appendChild(btn);
-        mbAppendLog('\n');
+        rs.appendChild(btn);
+        // Inline log mention so the link is also discoverable from the log.
+        mbAppendLog('Bundle zip ready: ' + zname + '\n');
+      } else {
+        rs.textContent = 'Complete ✓';
       }
-      document.getElementById('mb-runstatus').textContent = 'Complete ✓';
       es.close();
     } else if(msg.type === 'error'){
       mbAppendLog('ERROR: ' + msg.text + '\n');
