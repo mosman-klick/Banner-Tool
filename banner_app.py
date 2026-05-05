@@ -8586,8 +8586,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "Couldn't download any banner. " + " ; ".join(errors)})
             return
 
-        # Use the staging page's path tail as a friendly bundle name
-        bundle_name = url.rstrip("/").split("/")[-1] or "klick_capture"
+        # Use the staging page's path tail as a friendly bundle name. Strip
+        # the query / fragment / trailing slashes first, then keep only safe
+        # filename chars — otherwise we end up with bundle names like
+        # `index.html?1778011457958` which produce a zip filename containing
+        # `?`, which then breaks the /download/<file> URL on the frontend
+        # (encodeURIComponent → %3F → server can't find the file).
+        # For multi-line inputs (paste of asset URLs), use the LAST line.
+        last_line = (url.splitlines() or [url])[-1].rstrip("/")
+        raw_tail = (last_line.split("?")[0].split("#")[0].split("/")[-1]
+                    or "klick_capture")
+        bundle_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_tail).strip("._-") \
+                      or "klick_capture"
         sess.multi_meta = {"source_url": url, "user": user, "name": bundle_name}
 
         self._json({
@@ -9240,7 +9250,11 @@ class Handler(BaseHTTPRequestHandler):
         """
         sess = self.sess
         bare = self.path.split("?", 1)[0]
-        name = bare[len("/download/"):]
+        # The frontend uses encodeURIComponent() to build the URL — decode
+        # back to the actual filename before looking on disk. Without this,
+        # any zip whose name contains characters that need encoding (e.g.
+        # %3F for ?, %20 for space) would 404.
+        name = urllib.parse.unquote(bare[len("/download/"):])
         # Strip any path separators — only allow direct children of work_dir.
         if not name or "/" in name or "\\" in name or name in (".", ".."):
             self._send(400, "text/plain", b"bad name"); return
