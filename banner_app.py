@@ -4307,6 +4307,35 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') ThemeManager._closeSchemeMenu();
   });
+
+  // ── Bookmarklet integration ──────────────────────────────────────────────
+  // The Banner Tool ships a bookmarklet (see Multi-Banner Viewer tab) that
+  // collects every banner URL from a Ziflow proof (running in the user's
+  // logged-in browser context, so it works for private Klick proofs without
+  // the user having to paste cookies). The bookmarklet sends users back here
+  // with `?ml=<url-list>` and `#tab-multi`. Honour both: switch tab, fill
+  // the URL field, and auto-fire mbLoad().
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const ml = params.get('ml');
+    if (ml) {
+      // Switch to the Multi-Banner Viewer tab.
+      try { switchTab('multi'); } catch (e) {}
+      const urlBox = document.getElementById('mb-url');
+      if (urlBox) {
+        urlBox.value = ml;
+        // Fire the existing load flow after the tab is visible.
+        setTimeout(() => { try { mbLoad(); } catch (e) {} }, 100);
+      }
+      // Clean the URL so a refresh doesn't re-trigger.
+      const cleaned = window.location.pathname + (window.location.hash || '');
+      window.history.replaceState({}, '', cleaned);
+    } else if (window.location.hash && window.location.hash.startsWith('#tab-')) {
+      // Allow deep-linking to a tab without other params.
+      const tab = window.location.hash.slice('#tab-'.length);
+      try { switchTab(tab); } catch (e) {}
+    }
+  } catch (e) { /* never let init noise break the page */ }
 });
 </script>
 </head>
@@ -4689,21 +4718,44 @@ document.addEventListener('DOMContentLoaded', () => {
         </label>
       </div>
       <p class="bc-status" id="mb-status"></p>
-      <p class="hint" style="margin:6px 0 0;">
+
+      <!-- ═══ Bookmarklet for private Klick Ziflow proofs ═══════════════════
+           One-time setup: drag this link to your bookmarks bar. Then on any
+           Ziflow proof page (where you're already logged in) click the
+           bookmark — it cycles through every banner, collects each iframe
+           src, and re-opens the Banner Tool with the URLs auto-filled.
+           No cookies, no DevTools, no manual paste. -->
+      <div style="margin-top:10px;padding:10px 12px;border:1.5px dashed var(--border-default);border-radius:8px;background:var(--bg-elevated);">
+        <p style="margin:0 0 6px;font-size:11px;color:var(--text-secondary);letter-spacing:.04em;">
+          🚀 ONE-CLICK ZIFLOW LOAD (Klick proofs)
+        </p>
+        <div class="row" style="align-items:center;gap:10px;">
+          <a id="mb-bookmarklet" class="btn btn-p btn-sm"
+             href="javascript:void(0)"
+             title="Drag this to your bookmarks bar (one-time). Then visit any Ziflow proof while logged in and click the bookmark — banners auto-load here."
+             onclick="event.preventDefault(); alert('Drag this button to your bookmarks bar instead of clicking it.\n\n(Right-click it and choose Bookmark Link to add it manually.)');">
+            📌 Banner Tool: Get from Ziflow
+          </a>
+          <button class="btn btn-g btn-sm" onclick="mbCopyBookmarklet()">📋 Copy bookmarklet code</button>
+          <span style="font-size:11px;color:var(--text-muted);">
+            Drag the purple button → bookmarks bar (one-time). Then click it on any Ziflow proof.
+          </span>
+        </div>
+      </div>
+
+      <p class="hint" style="margin:8px 0 0;">
         <strong>Klick / AdPiler:</strong> use the password from the staging email — leave Username blank.<br>
         <strong>DoubleClick Studio</strong> (URLs starting with
         <code>www.google.com/doubleclick/studio/externalpreview</code>): no
         login needed; just paste the URL.<br>
-        <strong>Ziflow proof</strong> (URLs like
-        <code>app.ziflow.io/proof/&lt;id&gt;</code>): public proofs work directly.
-        For <em>private</em> Klick proofs
-        (<code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>), use ANY of:
-        (a) paste your Ziflow session Cookie above; (b) paste each banner's
+        <strong>Ziflow proof</strong>: public proofs work directly. For
+        <em>private</em> Klick proofs
+        (<code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>), the easiest way
+        is the <em>📌 Get from Ziflow</em> bookmarklet above. Or, manually:
+        (a) paste your Ziflow Cookie above, (b) paste each banner's
         <code>proof-assets.ziflow.io/.../richMedia/&lt;guid&gt;/index.html</code>
-        URL on a separate line in the Staging URL box; (c) download the
-        bundle from Ziflow and use <em>Storyboard → Load folder</em>.<br>
-        <strong>HTTP Basic Auth</strong> (browser popup asks for user+pass):
-        fill both fields.
+        URL on a separate line, or (c) use <em>Storyboard → Load folder</em>.<br>
+        <strong>HTTP Basic Auth</strong>: fill both Username + Password fields.
       </p>
     </div>
 
@@ -5754,6 +5806,94 @@ function mbAppendLog(t){
   const el = document.getElementById('mb-log');
   el.textContent += t;
   el.scrollTop = el.scrollHeight;
+}
+
+// ── Ziflow bookmarklet ────────────────────────────────────────────────────
+// Build the bookmarklet href once on page load. The bookmarklet, when
+// triggered on a Ziflow proof page, cycles through every banner using the
+// same selectors the server-side Playwright code uses, collects the iframe
+// srcs, and opens the Banner Tool with `?ml=<urls>#tab-multi`. Auto-loads
+// without further user action.
+function _bannerToolBookmarkletSource() {
+  // Hard-code the deployed origin so the bookmarklet works no matter which
+  // page initially provided it. (Falls back to current origin during local
+  // dev so a developer hitting localhost gets a localhost-pointing bookmarklet.)
+  const APP_HOST = (location.hostname.endsWith('.hf.space') || location.hostname.endsWith('huggingface.co'))
+    ? location.origin
+    : location.origin;
+  // Body of the bookmarklet — wrapped in (async()=>{...})() so we can await.
+  // Keep it compact; readable form lives next to this comment for easy edit.
+  /* readable form:
+     if (!/ziflow\.io\/proof\//.test(location.href)) {
+       alert('Open a Ziflow proof page first, then click this bookmark.');
+       return;
+     }
+     const ifr = () => {
+       const f = document.querySelector('iframe[name^="ziflow-iframe-"]');
+       return f && f.src ? f.src : '';
+     };
+     const total = (() => {
+       const m = document.body.innerText.match(/(\d+)\s*of\s*(\d+)/i);
+       return m ? +m[2] : 1;
+     })();
+     const urls = [];
+     for (let i = 0; i < total; i++) {
+       let src = '';
+       for (let t = 0; t < 30; t++) {  // up to 9s wait for iframe to load
+         src = ifr();
+         if (src && src.includes('richMedia')) break;
+         await new Promise(r => setTimeout(r, 300));
+       }
+       if (src && !urls.includes(src)) urls.push(src);
+       if (i < total - 1) {
+         const nx = document.querySelector('a[data-selector="asset-switcher-next"]');
+         if (!nx || (nx.className||'').includes('disabled')) break;
+         nx.click();
+         const prev = src;
+         for (let t = 0; t < 30; t++) {
+           const n = ifr();
+           if (n && n !== prev) break;
+           await new Promise(r => setTimeout(r, 300));
+         }
+       }
+     }
+     if (!urls.length) {
+       alert('No banners found. Are you on a Ziflow proof page?');
+       return;
+     }
+     const tgt = APP_HOST + '/?ml=' + encodeURIComponent(urls.join('\n'));
+     window.open(tgt, '_blank');
+  */
+  const code =
+    "(async()=>{if(!/ziflow\\.io\\/proof\\//.test(location.href)){alert('Open a Ziflow proof page first, then click this bookmark.');return;}" +
+    "const ifr=()=>{const f=document.querySelector('iframe[name^=\"ziflow-iframe-\"]');return f&&f.src?f.src:'';};" +
+    "const total=(()=>{const m=document.body.innerText.match(/(\\d+)\\s*of\\s*(\\d+)/i);return m?+m[2]:1;})();" +
+    "const urls=[];for(let i=0;i<total;i++){let src='';" +
+    "for(let t=0;t<30;t++){src=ifr();if(src&&src.includes('richMedia'))break;await new Promise(r=>setTimeout(r,300));}" +
+    "if(src&&!urls.includes(src))urls.push(src);" +
+    "if(i<total-1){const nx=document.querySelector('a[data-selector=\"asset-switcher-next\"]');" +
+    "if(!nx||(nx.className||'').includes('disabled'))break;nx.click();" +
+    "const prev=src;for(let t=0;t<30;t++){const n=ifr();if(n&&n!==prev)break;await new Promise(r=>setTimeout(r,300));}}}" +
+    "if(!urls.length){alert('No banners found. Are you on a Ziflow proof page?');return;}" +
+    "window.open(" + JSON.stringify(APP_HOST) + "+'/?ml='+encodeURIComponent(urls.join('\\n')),'_blank');})();";
+  return 'javascript:' + code;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  // Set the bookmarklet href once the host is known.
+  const a = document.getElementById('mb-bookmarklet');
+  if (a) a.href = _bannerToolBookmarkletSource();
+});
+
+async function mbCopyBookmarklet(){
+  const code = _bannerToolBookmarkletSource();
+  try{
+    await navigator.clipboard.writeText(code);
+    mbStatus('✓ Bookmarklet copied. Create a new bookmark in your browser, paste this as the URL, name it "Banner Tool: Get from Ziflow".', 'ok');
+  }catch(e){
+    // Fallback for browsers blocking clipboard without explicit user gesture.
+    prompt('Copy this and paste as a new bookmark URL:', code);
+  }
 }
 
 async function mbLoad(){
