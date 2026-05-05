@@ -1,0 +1,18 @@
+# macOS desktop-build artifacts (irrelevant to the hosted version)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+dist 2/
+*.zip
+*.egg-info/
+.DS_Store
+
+# Local desktop launcher / build tooling
+Launch Banner App v3.app/
+
+# Editor / IDE noise
+.idea/
+.vscode/

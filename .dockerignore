@@ -1,0 +1,24 @@
+# Don't ship the macOS desktop-build artifacts in the Docker image.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+dist 2/
+*.zip
+*.egg-info/
+.DS_Store
+
+# Local desktop launcher / build tooling — irrelevant on Linux.
+Launch Banner App v3.app/
+BUILD ME FIRST.command
+build_dist.sh
+banner_app.spec
+_run.sh
+
+# Editor / VCS noise
+.idea/
+.vscode/
+.git/
+.gitignore
