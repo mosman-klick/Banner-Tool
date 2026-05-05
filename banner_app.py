@@ -4458,7 +4458,9 @@ document.addEventListener('DOMContentLoaded', () => {
           <input type="text" id="story-footer" placeholder="© 2026 Vertex Pharmaceuticals Incorporated | VXR-US-34-2500240 (v7.0) | 04/2026">
         </label>
         <button class="btn btn-g btn-sm" onclick="storyAutoLoad()">⟳ Refresh from latest capture</button>
-        <button class="btn btn-g btn-sm" onclick="storyBrowseBundle()">📂 Load other bundle…</button>
+        <button class="btn btn-g btn-sm" onclick="document.getElementById('story-bundle-input').click()">📂 Load bundle (.zip)…</button>
+        <input id="story-bundle-input" type="file" accept=".zip"
+               style="display:none" onchange="storyUploadBundle(this)">
       </div>
 
       <div class="bundle-strip" id="bundle-strip-gen">
@@ -4469,7 +4471,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <p class="hint" style="padding:24px 8px;color:var(--text-secondary);">
           Run a capture on the <strong>Multi-Banner Viewer</strong> tab first.
           When it finishes, come back here — the captured frames will appear automatically.
-          Or click <em>Load other bundle</em> to pick a previously-captured folder.
+          Or click <em>Load bundle (.zip)</em> to upload a previously-downloaded capture zip.
         </p>
       </div>
 
@@ -5619,12 +5621,27 @@ async function storyAutoLoad(){
   if(replacePages.length) storyReplaceRender();
 }
 
-async function storyBrowseBundle(){
-  // Hosted: there's no local-folder browser. The Storyboard tab works on
-  // the most recent Multi-Banner capture in this session — run a Multi-Banner
-  // capture first and then come back here.
-  storySetStatus('Run a capture in the Multi-Banner Viewer tab first — '
-               + 'the Storyboard auto-loads it on the next visit.', '');
+async function storyUploadBundle(input){
+  // Hosted equivalent of the old "Load other bundle…" folder picker — accept
+  // a .zip the user previously downloaded from a Multi-Banner capture, and
+  // extract + scan it server-side.
+  if(!input.files || !input.files.length) return;
+  const file = input.files[0];
+  storySetStatus('Uploading ' + file.name + ' ('
+               + (file.size/(1024*1024)).toFixed(1) + ' MB)…');
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  let d;
+  try{
+    const r = await busyFetch('/upload/storyboard-bundle',
+      {method:'POST', body: fd}, 'Uploading + extracting bundle…');
+    d = await r.json();
+  }catch(e){ storySetStatus('⚠ '+e.message, 'err'); return; }
+  if(!d.ok){ storySetStatus('⚠ '+(d.error||'Upload failed'), 'err'); return; }
+  storyBundle  = d.bundle;
+  storyBanners = (d.banners || []).map(b => Object.assign({notes: ['','','','']}, b));
+  storyRender(d.bundle, storyBanners);
+  storySetStatus('✓ Loaded: '+d.name, 'ok');
 }
 
 // Update the bundle thumbnail strip in BOTH storyboard modes — visual confirmation
@@ -7212,6 +7229,7 @@ class Handler(BaseHTTPRequestHandler):
             "/upload/isi-doc":             self._upload_isi_doc,
             "/upload/storyboard":          self._upload_storyboard_pdf,
             "/upload/storyboard-existing": self._upload_existing_storyboard_pdf,
+            "/upload/storyboard-bundle":   self._upload_storyboard_bundle,
             # ── ISI Compare (page 2) ──
             "/isi/banner":     self._isi_banner_text,
             "/isi/upload":     self._isi_upload_doc,
@@ -7408,6 +7426,71 @@ class Handler(BaseHTTPRequestHandler):
             shutil.rmtree(target, ignore_errors=True)
         saved = self._save_uploads_to("storyboard-existing", [files[0]], single_file=True)
         self._json({"ok": True, "filename": saved[0] if saved else None})
+
+    def _upload_storyboard_bundle(self):
+        """Receive a previously-downloaded multi-banner capture bundle as a
+        .zip, extract it under sess.work_dir, and set sess.last_bundle so the
+        Storyboard tab picks it up.
+
+        Replaces the old AppleScript folder-picker flow that asked for a
+        local path — hosted users now upload the zip they downloaded earlier.
+        """
+        sess = self.sess
+        parts = self._read_multipart()
+        files = [p for p in parts if p.get("filename")]
+        if not files:
+            self._json({"ok": False, "error": "No file received."}); return
+        f = files[0]
+        if not (f["filename"] or "").lower().endswith(".zip"):
+            self._json({"ok": False, "error": "Please upload a .zip bundle."}); return
+
+        # Save the zip into a fresh per-session subfolder, then extract.
+        bundles_root = sess.work_dir / "loaded-bundles"
+        bundles_root.mkdir(parents=True, exist_ok=True)
+        # Use a unique subfolder per upload so successive loads don't collide.
+        slot = f"b{int(time.monotonic()*1000) & 0xFFFFFF:x}"
+        target = bundles_root / slot
+        target.mkdir(parents=True, exist_ok=True)
+        zip_path = target / "_upload.zip"
+        zip_path.write_bytes(f["data"])
+
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                # Defend against zip-slip (paths escaping target).
+                base = target.resolve()
+                for n in zf.namelist():
+                    out = (target / n).resolve()
+                    try:
+                        out.relative_to(base)
+                    except ValueError:
+                        self._json({"ok": False,
+                                    "error": "Bundle contained a path outside the upload folder."})
+                        return
+                zf.extractall(target)
+        except zipfile.BadZipFile:
+            self._json({"ok": False, "error": "Not a valid zip file."}); return
+        except Exception as e:
+            self._json({"ok": False, "error": f"Couldn't extract zip: {e}"}); return
+        finally:
+            zip_path.unlink(missing_ok=True)
+
+        # The downloaded bundle has shape:  <bundle_name>_capture/<size>/...
+        # First try the target itself; if that yields nothing, look one level
+        # deeper (a single subfolder = the bundle root inside the zip).
+        candidate = target
+        banners = _scan_capture_bundle(candidate)
+        if not banners:
+            children = [p for p in target.iterdir() if p.is_dir()]
+            if len(children) == 1:
+                candidate = children[0]
+                banners = _scan_capture_bundle(candidate)
+        if not banners:
+            self._json({"ok": False,
+                        "error": "No banner sub-folders with PNG frames found in the zip."})
+            return
+        sess.last_bundle = candidate
+        self._json({"ok": True, "bundle": str(candidate), "banners": banners,
+                    "name": candidate.name})
 
     # ── Validate ───────────────────────────────────────────────────────────────
     def _validate(self):
