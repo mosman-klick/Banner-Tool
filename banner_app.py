@@ -354,6 +354,44 @@ def _ziflow_url_to_local(url: str) -> Path:
     return tmp
 
 
+def _parse_ziflow_asset_urls(text: str) -> list:
+    """Detect a paste of multiple Ziflow asset CDN URLs and parse them.
+
+    Returns [{name, url, creative_id}, ...] when the input is 2+ non-empty
+    lines (or comma-separated values) and EVERY line matches the asset CDN
+    pattern. Returns [] otherwise — the caller falls back to other routing.
+
+    This is the manual workaround for private Klick proofs: the user opens
+    the proof in their logged-in browser, copies each banner's iframe `src`
+    one by one, and pastes them newline-separated into the Multi-Banner
+    Viewer URL field. Bypasses Ziflow's auth gate entirely since the asset
+    CDN itself is public.
+    """
+    lines = [l.strip() for l in text.replace(",", "\n").splitlines() if l.strip()]
+    if len(lines) < 2:
+        return []
+    pattern = re.compile(
+        r"^https://proof-assets\.ziflow\.io/Proofs/([0-9a-f-]+)/richMedia/([0-9a-f-]+)/",
+        re.I)
+    out = []
+    seen_guids = set()
+    for line in lines:
+        m = pattern.match(line)
+        if not m:
+            return []   # all-or-nothing
+        proof_guid, asset_guid = m.group(1), m.group(2)
+        if asset_guid in seen_guids:
+            continue
+        seen_guids.add(asset_guid)
+        out.append({
+            "name":        f"banner_{asset_guid[:8]}",
+            "url":         (f"https://proof-assets.ziflow.io/Proofs/{proof_guid}"
+                            f"/richMedia/{asset_guid}/index.html"),
+            "creative_id": asset_guid,
+        })
+    return out
+
+
 def _discover_ziflow_banners(proof_url: str) -> list:
     """Walk a Ziflow proof page and return one entry per banner found.
 
@@ -589,36 +627,93 @@ class ZiflowAuthGateError(Exception):
     """
 
 
-async def _discover_ziflow_banners_async(proof_url: str) -> list:
+def _parse_cookie_header(cookie_header: str, host: str) -> list:
+    """Parse a 'name=value; name=value' Cookie header into Playwright
+    cookie dicts. Returns a list of cookies attached to both the host
+    itself and `.ziflow.io` so it works regardless of which subdomain
+    set them.
+
+    Robust to common paste shapes:
+    - Raw `name=value; name2=value2`
+    - A `Cookie: name=value;...` line copied from DevTools (we strip the
+      `Cookie:` prefix and any wrapping quotes/whitespace)
+    """
+    if not cookie_header:
+        return []
+    s = cookie_header.strip()
+    # Strip a leading "Cookie:" if pasted from a Request Headers panel.
+    if s.lower().startswith("cookie:"):
+        s = s[7:].strip()
+    # Strip wrapping quotes (curl --cookie 'foo=bar' style).
+    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+        s = s[1:-1]
+    cookies = []
+    for chunk in s.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        name, value = chunk.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if not name:
+            continue
+        # Add for the specific host *and* the .ziflow.io parent so cookies
+        # set on klickhealth.ziflow.io reach proof-assets.ziflow.io too.
+        for domain in {host, ".ziflow.io"}:
+            if not domain:
+                continue
+            cookies.append({"name": name, "value": value,
+                            "domain": domain, "path": "/"})
+    return cookies
+
+
+async def _discover_ziflow_banners_async(proof_url: str, cookie_header: str = "") -> list:
     """Drive a Ziflow proof SPA with Playwright to discover every banner.
 
     Returns a list of {name, url, creative_id} dicts shaped like the other
     discovery helpers so `_multi_load` can treat all sources uniformly.
 
     Raises ZiflowAuthGateError if the proof requires login (Ziflow redirects
-    anonymous viewers to a `/public-token` identity-verification page).
+    anonymous viewers to a `/public-token` identity-verification page) AND
+    no `cookie_header` was provided (or the cookies didn't bypass the gate).
+
+    Args:
+        proof_url:     the Ziflow proof page URL.
+        cookie_header: optional `name=value; name=value` Cookie header
+                       string. When provided, cookies are attached to the
+                       Playwright context before navigation, so users with
+                       a logged-in Ziflow session can paste their cookies
+                       to access private (Klick) proofs.
 
     Algorithm:
-    1. Open the proof URL.
-    2. Detect the public-token / "Verify your identity" auth gate. If
+    1. (Optional) Set cookies on the Playwright context.
+    2. Open the proof URL.
+    3. Detect the public-token / "Verify your identity" auth gate. If
        present, raise ZiflowAuthGateError.
-    3. Wait for the proof viewer's iframe to mount (its src is the current
+    4. Wait for the proof viewer's iframe to mount (its src is the current
        banner's index.html on proof-assets.ziflow.io).
-    4. Read the "1 of M" counter to get the total count (used as a safety
-       cap on the click loop).
-    5. Loop up to M times:
-       a. Read the iframe src → extract proof_guid + asset_guid.
-       b. Append (de-duped) to the result list.
-       c. If the "Next" chevron is disabled, stop.
-       d. Click "Next" and wait for the iframe src to change.
-    6. Return the collected list.
+    5. Read the "1 of M" counter to get the total count.
+    6. Loop up to M times: capture iframe src → extract proof+asset guid →
+       click "Next" → wait for iframe src to change.
+    7. Return the collected list.
     """
     from playwright.async_api import async_playwright
+    import urllib.parse
+
+    host = urllib.parse.urlparse(proof_url).hostname or ""
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         try:
             ctx  = await browser.new_context(user_agent=_UA_HEADERS["User-Agent"])
+            cookies = _parse_cookie_header(cookie_header, host)
+            if cookies:
+                try:
+                    await ctx.add_cookies(cookies)
+                except Exception:
+                    # Bad cookie shape shouldn't kill the whole flow —
+                    # let the auth-gate detector surface a clean error
+                    # downstream if the cookies don't unlock the proof.
+                    pass
             page = await ctx.new_page()
             await page.goto(proof_url, wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(2_000)  # let SPA bootstrap
@@ -629,13 +724,24 @@ async def _discover_ziflow_banners_async(proof_url: str) -> list:
             if (current_url.endswith("/public-token")
                     or "verify your identity" in body_text.lower()
                     or "already a user? sign in" in body_text.lower()):
+                already_tried_cookies = bool(cookies)
+                if already_tried_cookies:
+                    raise ZiflowAuthGateError(
+                        "Ziflow rejected the cookies you pasted (likely "
+                        "expired or wrong session). Re-copy your Cookie "
+                        "header from DevTools → Network → any ziflow.io "
+                        "request → Headers, paste it into the Cookie field, "
+                        "and try again.")
                 raise ZiflowAuthGateError(
                     "This Ziflow proof requires login (Klick's proofs are "
-                    "private). Workaround: download the bundle from Ziflow "
-                    "yourself, then load it on the Storyboard tab via "
-                    "'Load folder…' — or capture each banner one at a time "
-                    "via the Frame Capture tab using the proof's individual "
-                    "asset URLs.")
+                    "private). Three workarounds: (1) paste your Ziflow "
+                    "session Cookie into the Cookie field below — copy from "
+                    "DevTools → Network → any ziflow.io request → Headers → "
+                    "Cookie; (2) paste each banner's iframe-src URL "
+                    "(proof-assets.ziflow.io/.../richMedia/<guid>/index.html) "
+                    "newline-separated into the Staging URL field instead "
+                    "of the proof URL; (3) download the bundle from Ziflow "
+                    "and load it on the Storyboard tab via 'Load folder…'.")
 
             # Wait for the proof viewer to mount the banner iframe.
             await page.wait_for_selector(
@@ -4563,9 +4669,10 @@ document.addEventListener('DOMContentLoaded', () => {
     <!-- Loader card -->
     <div class="mb-loader">
       <div class="row" style="margin-bottom:8px;">
-        <label>Staging URL
-          <input type="text" id="mb-url"
-                 placeholder="https://klick.link-staging.com/...">
+        <label style="flex:2;">Staging URL <span style="color:var(--text-muted);">(or paste many asset URLs, one per line)</span>
+          <textarea id="mb-url" rows="1"
+                    placeholder="https://klick.link-staging.com/... &#10;OR&#10;https://proof-assets.ziflow.io/Proofs/.../richMedia/.../index.html (one per line)"
+                    style="resize:vertical;min-height:34px;font-family:Menlo,monospace;font-size:12px;padding:8px 10px;border-radius:7px;border:1.5px solid var(--border-default);background:var(--bg-input);color:var(--text-primary);outline:none;"></textarea>
         </label>
         <label>Username <span style="color:var(--text-muted);">(optional)</span>
           <input type="text" id="mb-user" placeholder="leave blank for Klick links">
@@ -4575,19 +4682,26 @@ document.addEventListener('DOMContentLoaded', () => {
         </label>
         <button class="btn btn-p btn-sm" onclick="mbLoad()" style="align-self:flex-end;">Load all banners</button>
       </div>
+      <div class="row" style="margin-bottom:8px;">
+        <label style="flex:1;">Ziflow Cookie <span style="color:var(--text-muted);">(optional, only needed for private Klick proofs)</span>
+          <input type="text" id="mb-cookie"
+                 placeholder="paste your Ziflow Cookie header — DevTools → Network → any ziflow.io request → Headers → Cookie">
+        </label>
+      </div>
       <p class="bc-status" id="mb-status"></p>
       <p class="hint" style="margin:6px 0 0;">
         <strong>Klick / AdPiler:</strong> use the password from the staging email — leave Username blank.<br>
         <strong>DoubleClick Studio</strong> (URLs starting with
         <code>www.google.com/doubleclick/studio/externalpreview</code>): no
-        login needed; just paste the URL and click Load. The app cycles
-        through every creative in the size dropdown.<br>
+        login needed; just paste the URL.<br>
         <strong>Ziflow proof</strong> (URLs like
-        <code>app.ziflow.io/proof/&lt;id&gt;</code>): the app finds every banner
-        on the proof page. Note: <em>private</em> Klick proofs (e.g.
-        <code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>) require login, which
-        the server can't do on your behalf — for those, download the bundle
-        from Ziflow and use <em>Storyboard → Load folder</em>.<br>
+        <code>app.ziflow.io/proof/&lt;id&gt;</code>): public proofs work directly.
+        For <em>private</em> Klick proofs
+        (<code>klickhealth.ziflow.io/proof/&lt;id&gt;</code>), use ANY of:
+        (a) paste your Ziflow session Cookie above; (b) paste each banner's
+        <code>proof-assets.ziflow.io/.../richMedia/&lt;guid&gt;/index.html</code>
+        URL on a separate line in the Staging URL box; (c) download the
+        bundle from Ziflow and use <em>Storyboard → Load folder</em>.<br>
         <strong>HTTP Basic Auth</strong> (browser popup asks for user+pass):
         fill both fields.
       </p>
@@ -5643,10 +5757,14 @@ function mbAppendLog(t){
 }
 
 async function mbLoad(){
-  const url  = document.getElementById('mb-url').value.trim();
-  const user = document.getElementById('mb-user').value.trim();
-  const pass = document.getElementById('mb-pass').value;
-  if(!url){ mbStatus('Paste a Klick staging URL first.', 'err'); return; }
+  // Note: #mb-url is a <textarea> so it can hold a single URL or multiple
+  // newline-separated asset CDN URLs (the manual workaround for private
+  // Ziflow proofs). The server's _multi_load auto-detects which mode.
+  const url    = document.getElementById('mb-url').value.trim();
+  const user   = document.getElementById('mb-user').value.trim();
+  const pass   = document.getElementById('mb-pass').value;
+  const cookie = document.getElementById('mb-cookie').value.trim();
+  if(!url){ mbStatus('Paste a staging / proof URL (or asset URLs) first.', 'err'); return; }
   mbStatus('Signing in + downloading banners…');
 
   document.getElementById('mb-views').innerHTML = '';
@@ -5657,7 +5775,7 @@ async function mbLoad(){
   try{
     const r = await busyFetch('/multi/load', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url, user, password: pass}),
+      body: JSON.stringify({url, user, password: pass, cookie}),
     }, 'Signing in + downloading banners…');
     d = await r.json();
   }catch(e){
@@ -8066,26 +8184,36 @@ class Handler(BaseHTTPRequestHandler):
     def _multi_load(self):
         """Discover every banner on the source URL and download each.
 
-        Three URL flavors are supported:
+        URL flavors supported (auto-detected):
           1. **Klick / AdPiler staging** — form-based password gate, banners
-             served via iframes on the same page (Playwright drives the auth).
-          2. **DoubleClick Studio external-preview** — no auth, single-page
-             dropdown (Playwright cycles through creative sizes).
-          3. **Ziflow proof URL** — public; HTML lists every banner's asset
-             GUID (no Playwright needed; faster than the others).
+             served via iframes on the same page (Playwright drives auth).
+          2. **DoubleClick Studio external-preview** — no auth, dropdown of
+             creatives (Playwright cycles through sizes).
+          3. **Ziflow proof URL** — public proofs work via cheap regex; for
+             private (Klick) proofs the user can paste their Ziflow Cookie
+             into `cookie` to authenticate.
+          4. **Multi-URL paste** — for private proofs without cookies, the
+             user can paste each banner's `proof-assets.ziflow.io/.../
+             richMedia/<guid>/index.html` URL on separate lines (or comma-
+             separated) and skip discovery entirely.
         """
         sess = self.sess
         body = self._body()
-        url  = (body.get("url") or "").strip()
-        user = (body.get("user") or "").strip()
-        pwd  = body.get("password") or ""
+        url    = (body.get("url") or "").strip()
+        user   = (body.get("user") or "").strip()
+        pwd    = body.get("password") or ""
+        cookie = (body.get("cookie") or "").strip()
 
         if not url:
             self._json({"ok": False, "error": "Staging URL is required."}); return
 
-        # Route to the appropriate discovery handler based on URL pattern.
+        # Route to the appropriate discovery handler based on URL shape.
         try:
-            if ZIFLOW_PROOF_RE.match(url):
+            # ── Multi-URL paste (newline / comma-separated asset CDN URLs) ──
+            manual = _parse_ziflow_asset_urls(url)
+            if manual:
+                banners = manual
+            elif ZIFLOW_PROOF_RE.match(url):
                 # Ziflow has two flavors:
                 #   1. Old-style proofs that ship every banner's richMedia
                 #      reference statically — the cheap regex helper finds
@@ -8095,12 +8223,14 @@ class Handler(BaseHTTPRequestHandler):
                 #      static HTML. For these we drive the SPA with
                 #      Playwright (slower, ~10-20s per proof).
                 # Try the cheap path first; fall back to async discovery if
-                # we found fewer than 2 banners (which means either it's an
-                # SPA or the proof is genuinely single-banner).
+                # we found fewer than 2 banners (means it's an SPA or
+                # genuinely single-banner). Pass the Ziflow cookie if the
+                # user provided one — needed for private Klick proofs.
                 banners = _discover_ziflow_banners(url)
                 if len(banners) < 2:
                     with PLAYWRIGHT_SEM:
-                        banners = asyncio.run(_discover_ziflow_banners_async(url))
+                        banners = asyncio.run(
+                            _discover_ziflow_banners_async(url, cookie_header=cookie))
             elif DOUBLECLICK_PREVIEW_RE.match(url):
                 with PLAYWRIGHT_SEM:
                     banners = asyncio.run(_discover_doubleclick_banners(url))
