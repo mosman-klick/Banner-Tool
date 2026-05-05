@@ -355,20 +355,22 @@ def _ziflow_url_to_local(url: str) -> Path:
 
 
 def _parse_ziflow_asset_urls(text: str) -> list:
-    """Detect a paste of multiple Ziflow asset CDN URLs and parse them.
+    """Detect a paste of one or more Ziflow asset CDN URLs and parse them.
 
-    Returns [{name, url, creative_id}, ...] when the input is 2+ non-empty
-    lines (or comma-separated values) and EVERY line matches the asset CDN
-    pattern. Returns [] otherwise — the caller falls back to other routing.
+    Returns [{name, url, creative_id}, ...] when EVERY non-empty line
+    (newline- or comma-separated) matches the public asset CDN pattern
+    `https://proof-assets.ziflow.io/Proofs/<proof_guid>/richMedia/<asset_guid>/...`.
+    Returns [] otherwise — the caller falls back to other routing.
 
-    This is the manual workaround for private Klick proofs: the user opens
-    the proof in their logged-in browser, copies each banner's iframe `src`
-    one by one, and pastes them newline-separated into the Multi-Banner
-    Viewer URL field. Bypasses Ziflow's auth gate entirely since the asset
-    CDN itself is public.
+    Single-URL paste is supported: the bookmarklet sometimes only collects
+    one banner (e.g. on a 1-banner proof, or when the click-cycle bails),
+    and we still want that path to work without falling through to the
+    auth-gate-detecting Playwright route. Distinct enough from a proof URL
+    (klickhealth.ziflow.io/proof/<id>) that the all-or-nothing match keeps
+    routing safe.
     """
     lines = [l.strip() for l in text.replace(",", "\n").splitlines() if l.strip()]
-    if len(lines) < 2:
+    if not lines:
         return []
     pattern = re.compile(
         r"^https://proof-assets\.ziflow\.io/Proofs/([0-9a-f-]+)/richMedia/([0-9a-f-]+)/",
@@ -378,7 +380,7 @@ def _parse_ziflow_asset_urls(text: str) -> list:
     for line in lines:
         m = pattern.match(line)
         if not m:
-            return []   # all-or-nothing
+            return []   # all-or-nothing — partial match falls through
         proof_guid, asset_guid = m.group(1), m.group(2)
         if asset_guid in seen_guids:
             continue
@@ -5828,53 +5830,69 @@ function _bannerToolBookmarkletSource() {
        alert('Open a Ziflow proof page first, then click this bookmark.');
        return;
      }
-     const ifr = () => {
+     const sleep = ms => new Promise(r => setTimeout(r, ms));
+     const ifrSrc = () => {
        const f = document.querySelector('iframe[name^="ziflow-iframe-"]');
        return f && f.src ? f.src : '';
      };
-     const total = (() => {
-       const m = document.body.innerText.match(/(\d+)\s*of\s*(\d+)/i);
-       return m ? +m[2] : 1;
-     })();
+     const nextBtn = () => document.querySelector('a[data-selector="asset-switcher-next"]');
+     const isDisabled = el => el && (el.className||'').toLowerCase().includes('disabled');
+
+     // Wait up to 12s for the SPA to render the first banner.
+     for (let t = 0; t < 40; t++) {
+       const s = ifrSrc();
+       if (s && s.includes('richMedia')) break;
+       await sleep(300);
+     }
+
      const urls = [];
-     for (let i = 0; i < total; i++) {
+     for (let i = 0; i < 30; i++) {        // safety cap well above realistic banner count
+       // Capture this banner's iframe src.
        let src = '';
-       for (let t = 0; t < 30; t++) {  // up to 9s wait for iframe to load
-         src = ifr();
+       for (let t = 0; t < 40; t++) {
+         src = ifrSrc();
          if (src && src.includes('richMedia')) break;
-         await new Promise(r => setTimeout(r, 300));
+         await sleep(300);
        }
        if (src && !urls.includes(src)) urls.push(src);
-       if (i < total - 1) {
-         const nx = document.querySelector('a[data-selector="asset-switcher-next"]');
-         if (!nx || (nx.className||'').includes('disabled')) break;
-         nx.click();
-         const prev = src;
-         for (let t = 0; t < 30; t++) {
-           const n = ifr();
-           if (n && n !== prev) break;
-           await new Promise(r => setTimeout(r, 300));
-         }
+
+       // Advance to next banner. Done when Next is disabled or click does not advance.
+       const nx = nextBtn();
+       if (!nx || isDisabled(nx)) break;
+       const prev = src;
+       nx.click();
+       let changed = false;
+       for (let t = 0; t < 40; t++) {
+         const n = ifrSrc();
+         if (n && n !== prev) { changed = true; break; }
+         await sleep(300);
        }
+       if (!changed) break;
      }
+
      if (!urls.length) {
-       alert('No banners found. Are you on a Ziflow proof page?');
+       alert("Couldn't find any banners on this Ziflow proof.\n\n" +
+             "Make sure: (1) you're on a proof page (URL contains /proof/<id>); " +
+             "(2) you're signed in to Ziflow; (3) the proof has at least one banner.");
        return;
      }
-     const tgt = APP_HOST + '/?ml=' + encodeURIComponent(urls.join('\n'));
-     window.open(tgt, '_blank');
+     window.open(APP_HOST + '/?ml=' + encodeURIComponent(urls.join('\n')), '_blank');
   */
   const code =
     "(async()=>{if(!/ziflow\\.io\\/proof\\//.test(location.href)){alert('Open a Ziflow proof page first, then click this bookmark.');return;}" +
+    "const sleep=ms=>new Promise(r=>setTimeout(r,ms));" +
     "const ifr=()=>{const f=document.querySelector('iframe[name^=\"ziflow-iframe-\"]');return f&&f.src?f.src:'';};" +
-    "const total=(()=>{const m=document.body.innerText.match(/(\\d+)\\s*of\\s*(\\d+)/i);return m?+m[2]:1;})();" +
-    "const urls=[];for(let i=0;i<total;i++){let src='';" +
-    "for(let t=0;t<30;t++){src=ifr();if(src&&src.includes('richMedia'))break;await new Promise(r=>setTimeout(r,300));}" +
+    "const nx=()=>document.querySelector('a[data-selector=\"asset-switcher-next\"]');" +
+    "const dis=e=>e&&(e.className||'').toLowerCase().includes('disabled');" +
+    "for(let t=0;t<40;t++){const s=ifr();if(s&&s.includes('richMedia'))break;await sleep(300);}" +
+    "const urls=[];for(let i=0;i<30;i++){let src='';" +
+    "for(let t=0;t<40;t++){src=ifr();if(src&&src.includes('richMedia'))break;await sleep(300);}" +
     "if(src&&!urls.includes(src))urls.push(src);" +
-    "if(i<total-1){const nx=document.querySelector('a[data-selector=\"asset-switcher-next\"]');" +
-    "if(!nx||(nx.className||'').includes('disabled'))break;nx.click();" +
-    "const prev=src;for(let t=0;t<30;t++){const n=ifr();if(n&&n!==prev)break;await new Promise(r=>setTimeout(r,300));}}}" +
-    "if(!urls.length){alert('No banners found. Are you on a Ziflow proof page?');return;}" +
+    "const n=nx();if(!n||dis(n))break;" +
+    "const prev=src;n.click();" +
+    "let changed=false;for(let t=0;t<40;t++){const x=ifr();if(x&&x!==prev){changed=true;break;}await sleep(300);}" +
+    "if(!changed)break;}" +
+    "if(!urls.length){alert(\"Couldn't find any banners on this Ziflow proof.\\n\\nMake sure: (1) you're on a proof page (URL contains /proof/<id>); (2) you're signed in to Ziflow; (3) the proof has at least one banner.\");return;}" +
     "window.open(" + JSON.stringify(APP_HOST) + "+'/?ml='+encodeURIComponent(urls.join('\\n')),'_blank');})();";
   return 'javascript:' + code;
 }
