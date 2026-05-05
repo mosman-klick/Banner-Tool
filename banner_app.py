@@ -559,6 +559,129 @@ async def _discover_klick_banners(staging_url: str, user: str, password: str):
     return banners
 
 
+# ── Ziflow Multi-Banner discovery (Klick proofs are SPAs) ────────────────────
+#
+# Klick's Ziflow proof pages (klickhealth.ziflow.io) ship a 2.6 KB SPA shell
+# whose only static richMedia reference is the og:image (the FIRST banner's
+# thumbnail). A multi-banner proof shows "1 of M" in the toolbar and
+# lazy-loads each banner's index.html into an iframe as the user clicks the
+# "Next file" chevron. To enumerate every banner, we drive the SPA the same
+# way: render with Playwright, read the current iframe src, click next,
+# wait for src to change, repeat.
+#
+# Selectors verified live on klickhealth.ziflow.io 2026-05-05:
+#   - iframe holding the current banner: iframe[name^="ziflow-iframe-"]
+#   - "Next file" chevron:               a[data-selector="asset-switcher-next"]
+#   - "Prev file" chevron:               a[data-selector="asset-switcher-prev"]
+#   - When at first/last banner the chevron has class "disabled".
+ZIFLOW_BANNER_IFRAME_SELECTOR = 'iframe[name^="ziflow-iframe-"]'
+ZIFLOW_NEXT_SELECTOR          = 'a[data-selector="asset-switcher-next"]'
+
+
+async def _discover_ziflow_banners_async(proof_url: str) -> list:
+    """Drive a Ziflow proof SPA with Playwright to discover every banner.
+
+    Returns a list of {name, url, creative_id} dicts shaped like the other
+    discovery helpers so `_multi_load` can treat all sources uniformly.
+
+    Algorithm:
+    1. Open the proof URL.
+    2. Wait for the proof viewer's iframe to mount (its src is the current
+       banner's index.html on proof-assets.ziflow.io).
+    3. Read the "1 of M" counter to get the total count (used as a safety
+       cap on the click loop).
+    4. Loop up to M times:
+       a. Read the iframe src → extract proof_guid + asset_guid.
+       b. Append (de-duped) to the result list.
+       c. If the "Next" chevron is disabled, stop.
+       d. Click "Next" and wait for the iframe src to change.
+    5. Return the collected list.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            ctx  = await browser.new_context(user_agent=_UA_HEADERS["User-Agent"])
+            page = await ctx.new_page()
+            await page.goto(proof_url, wait_until="domcontentloaded", timeout=45_000)
+
+            # Wait for the proof viewer to mount the banner iframe.
+            await page.wait_for_selector(
+                ZIFLOW_BANNER_IFRAME_SELECTOR, state="attached", timeout=30_000)
+            # Give the iframe a moment to set its src to the asset CDN URL
+            # (Angular sets it after the wrapper appears).
+            for _ in range(20):
+                first_src = await page.evaluate(
+                    f"() => {{ const f = document.querySelector('{ZIFLOW_BANNER_IFRAME_SELECTOR}'); "
+                    f"return f && f.src ? f.src : null; }}")
+                if first_src and "richMedia" in first_src:
+                    break
+                await page.wait_for_timeout(500)
+
+            # Total count from "N of M" in the toolbar; defaults to 1 if no
+            # counter (single-banner proofs).
+            total = await page.evaluate(
+                "() => { const m = document.body.innerText.match(/(\\d+)\\s*of\\s*(\\d+)/i); "
+                "return m ? parseInt(m[2], 10) : 1; }"
+            ) or 1
+
+            # Iframe src → (proof_guid, asset_guid).
+            src_re = re.compile(
+                r"https://proof-assets\.ziflow\.io/Proofs/"
+                r"([0-9a-f-]+)/richMedia/([0-9a-f-]+)/", re.I)
+
+            results = []
+            seen_guids = set()
+            for step in range(max(1, total)):
+                src = await page.evaluate(
+                    f"() => {{ const f = document.querySelector('{ZIFLOW_BANNER_IFRAME_SELECTOR}'); "
+                    f"return f && f.src ? f.src : ''; }}") or ""
+                m = src_re.search(src)
+                if m:
+                    proof_guid, asset_guid = m.group(1), m.group(2)
+                    if asset_guid not in seen_guids:
+                        seen_guids.add(asset_guid)
+                        results.append({
+                            "name":        f"banner_{asset_guid[:8]}",
+                            "url":         (f"https://proof-assets.ziflow.io/Proofs/{proof_guid}"
+                                            f"/richMedia/{asset_guid}/index.html"),
+                            "creative_id": asset_guid,
+                        })
+                if len(results) >= total:
+                    break
+
+                # Stop if we're on the last banner (Next is "disabled").
+                next_state = await page.evaluate(
+                    f"() => {{ const a = document.querySelector('{ZIFLOW_NEXT_SELECTOR}'); "
+                    "if (!a) return 'missing'; "
+                    "return (a.className || '').toLowerCase().includes('disabled') ? 'disabled' : 'enabled'; }")
+                if next_state != "enabled":
+                    break
+
+                # Click Next and wait for the iframe src to swap.
+                prev_src = src
+                try:
+                    await page.click(ZIFLOW_NEXT_SELECTOR, timeout=4_000)
+                except Exception:
+                    break
+                try:
+                    await page.wait_for_function(
+                        f"prev => {{ const f = document.querySelector('{ZIFLOW_BANNER_IFRAME_SELECTOR}'); "
+                        "return f && f.src && f.src !== prev; }",
+                        arg=prev_src, timeout=10_000)
+                except Exception:
+                    # Try one more wait pass — sometimes Angular swaps the
+                    # iframe element entirely (different name suffix) so the
+                    # outer page-level src diff doesn't fire on the same
+                    # element. Re-query.
+                    await page.wait_for_timeout(800)
+
+            return results
+        finally:
+            await browser.close()
+
+
 async def _discover_doubleclick_banners(preview_url: str):
     """Render a Google DoubleClick Studio external-preview page, click through
     every creative in the dropdown, and return the underlying banner asset
@@ -7929,8 +8052,21 @@ class Handler(BaseHTTPRequestHandler):
         # Route to the appropriate discovery handler based on URL pattern.
         try:
             if ZIFLOW_PROOF_RE.match(url):
-                # Ziflow is a static HTTP fetch — no Playwright needed, no semaphore.
+                # Ziflow has two flavors:
+                #   1. Old-style proofs that ship every banner's richMedia
+                #      reference statically — the cheap regex helper finds
+                #      them in <1s, no Playwright needed.
+                #   2. Klick's modern proofs (klickhealth.ziflow.io) which
+                #      are SPAs — only the FIRST banner's guid is in the
+                #      static HTML. For these we drive the SPA with
+                #      Playwright (slower, ~10-20s per proof).
+                # Try the cheap path first; fall back to async discovery if
+                # we found fewer than 2 banners (which means either it's an
+                # SPA or the proof is genuinely single-banner).
                 banners = _discover_ziflow_banners(url)
+                if len(banners) < 2:
+                    with PLAYWRIGHT_SEM:
+                        banners = asyncio.run(_discover_ziflow_banners_async(url))
             elif DOUBLECLICK_PREVIEW_RE.match(url):
                 with PLAYWRIGHT_SEM:
                     banners = asyncio.run(_discover_doubleclick_banners(url))
