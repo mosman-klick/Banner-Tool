@@ -5119,28 +5119,63 @@ async function busyFetch(url, opts, msg){
   finally { clearBusy(); }
 }
 
+// ── Toast notifications ──────────────────────────────────────────────────────
+// Briefly pops up at the bottom-right with success / info / error. Auto-fades.
+// `kind` is 'ok' | 'info' | 'err'. Survives multiple stacked toasts.
+function showToast(message, kind){
+  let host = document.getElementById('toast-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'toast-host';
+    host.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:9999;'
+                       + 'display:flex;flex-direction:column;gap:8px;'
+                       + 'pointer-events:none;';
+    document.body.appendChild(host);
+  }
+  const t = document.createElement('div');
+  const palette = (kind === 'err')
+    ? 'background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;'
+    : (kind === 'ok')
+      ? 'background:#dcfce7;color:#14532d;border:1px solid #86efac;'
+      : 'background:#e0e7ff;color:#1e3a8a;border:1px solid #a5b4fc;';
+  t.style.cssText = palette
+    + 'padding:10px 14px;border-radius:8px;font-size:13px;'
+    + 'box-shadow:0 4px 12px rgba(0,0,0,0.15);max-width:380px;'
+    + 'opacity:0;transform:translateY(8px);transition:opacity .2s, transform .2s;'
+    + 'pointer-events:auto;font-family:inherit;';
+  t.textContent = message;
+  host.appendChild(t);
+  // Trigger transition into view.
+  requestAnimationFrame(() => { t.style.opacity = '1'; t.style.transform = 'translateY(0)'; });
+  // Auto-dismiss after 5s. Click also dismisses early.
+  const dismiss = () => {
+    t.style.opacity = '0'; t.style.transform = 'translateY(8px)';
+    setTimeout(() => t.remove(), 250);
+  };
+  t.addEventListener('click', dismiss);
+  setTimeout(dismiss, 5000);
+}
+
 // ── Save-As download helper ───────────────────────────────────────────────────
-// Three-tier strategy so downloads work everywhere:
+// Two-tier strategy:
 //
 //   1. showSaveFilePicker() — true Save As dialog (Chromium browsers, top-level
 //      pages only). Lets the user pick folder + filename.
 //
-//   2. Blob URL + <a download> — Safari, Firefox, embedded contexts. We fetch
-//      the file ourselves, wrap the bytes in a blob, and let the browser
-//      handle the download. More reliable than passing a server URL to <a>
-//      because some browsers ignore download= on cross-context URLs.
+//   2. Blob URL + <a download> — Safari, Firefox, embedded contexts. Fetch the
+//      bytes ourselves, wrap in a blob, click an <a download href="blob:...">.
+//      Works in all browsers; download attribute on a blob URL is honoured.
 //
-//   3. Direct navigation — last-resort if even fetch fails. The server sets
-//      Content-Disposition: attachment so the browser will download.
+// (No third "navigate to URL" fallback — it caused the tab to land on a "not
+// found" page when same-origin clicks raced with the download.) On failure,
+// `downloadFile` shows an error toast and returns false.
 //
-// `extension` should include the leading dot (".zip", ".pdf"). MUST be called
-// from a user-gesture handler (button onclick) — modern browsers block
-// programmatic downloads otherwise.
+// MUST be called from a user-gesture handler (button onclick).
 async function downloadFile(url, suggestedName, mimeType, extension){
   mimeType = mimeType || 'application/octet-stream';
   const _toplevel = (window.self === window.top);
 
-  // Path 1: Save As dialog (Chromium-based browsers, top-level page only).
+  // Path 1: Save As dialog (Chromium top-level only).
   if (_toplevel && typeof window.showSaveFilePicker === 'function') {
     try {
       const opts = { suggestedName: suggestedName };
@@ -5159,17 +5194,17 @@ async function downloadFile(url, suggestedName, mimeType, extension){
       await writable.write(blob);
       await writable.close();
       clearBusy();
+      showToast('✓ Saved ' + suggestedName, 'ok');
       return true;
     } catch (e) {
       clearBusy();
-      if (e && e.name === 'AbortError') return false;   // user cancelled
+      if (e && e.name === 'AbortError') return false;   // user cancelled — silent
       console.warn('showSaveFilePicker failed; falling back to blob link:', e);
       // fall through to path 2
     }
   }
 
-  // Path 2: Fetch as blob, then click an <a download>. Works in all browsers,
-  // sidesteps any issues with cross-context download attribute handling.
+  // Path 2: Fetch as blob, then click <a download> with a blob URL.
   try {
     setBusy('Downloading ' + suggestedName + '…');
     const resp = await fetch(url, { credentials: 'same-origin' });
@@ -5179,25 +5214,20 @@ async function downloadFile(url, suggestedName, mimeType, extension){
     const a = document.createElement('a');
     a.href = blobUrl;
     a.download = suggestedName || '';
+    a.style.display = 'none';
     document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    try { a.click(); } finally {
+      // Cleanup, but don't let removal errors mask the click.
+      try { document.body.removeChild(a); } catch(_) {}
+      setTimeout(() => { try { URL.revokeObjectURL(blobUrl); } catch(_) {} }, 60_000);
+    }
     clearBusy();
+    showToast('✓ Downloaded ' + suggestedName + ' — check your Downloads folder', 'ok');
     return true;
   } catch (e) {
     clearBusy();
-    console.error('Blob download failed:', e);
-    // fall through to path 3
-  }
-
-  // Path 3: Last resort — navigate the browser to the URL. The server's
-  // Content-Disposition: attachment header still triggers a download.
-  try {
-    window.location.href = url;
-    return true;
-  } catch (e) {
-    alert('Download failed: ' + (e && e.message || e));
+    console.error('Download failed:', e);
+    showToast('⚠ Download failed: ' + (e && e.message || e), 'err');
     return false;
   }
 }
@@ -6199,16 +6229,20 @@ async function mbRunAll(){
       if(msg.zip){
         const zname = msg.zip.split('/').pop();
         const url   = '/download/' + encodeURIComponent(zname);
-        // Prominent runstatus button.
         rs.innerHTML = '';
         const head = document.createElement('span');
         head.textContent = 'Complete ✓ — ';
         head.style.cssText = 'color:var(--accent-success);font-weight:600;margin-right:8px;';
         rs.appendChild(head);
         const btn = document.createElement('button');
+        btn.type = 'button';   // explicit so no <form> default-submit behaviour
         btn.className = 'btn btn-p btn-sm';
         btn.textContent = '⬇ Download zip (' + zname + ')';
-        btn.onclick = () => downloadFile(url, zname, 'application/zip', '.zip');
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          downloadFile(url, zname, 'application/zip', '.zip');
+        });
         rs.appendChild(btn);
         // Inline log mention so the link is also discoverable from the log.
         mbAppendLog('Bundle zip ready: ' + zname + '\n');
