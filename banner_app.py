@@ -4463,8 +4463,11 @@ document.addEventListener('DOMContentLoaded', () => {
           <input type="text" id="story-footer" placeholder="© 2026 Vertex Pharmaceuticals Incorporated | VXR-US-34-2500240 (v7.0) | 04/2026">
         </label>
         <button class="btn btn-g btn-sm" onclick="storyAutoLoad()">⟳ Refresh from latest capture</button>
-        <button class="btn btn-g btn-sm" onclick="document.getElementById('story-bundle-input').click()">📂 Load bundle (.zip)…</button>
-        <input id="story-bundle-input" type="file" accept=".zip"
+        <button class="btn btn-g btn-sm" onclick="document.getElementById('story-bundle-zip-input').click()">📦 Load .zip…</button>
+        <button class="btn btn-g btn-sm" onclick="document.getElementById('story-bundle-folder-input').click()">📁 Load folder…</button>
+        <input id="story-bundle-zip-input" type="file" accept=".zip"
+               style="display:none" onchange="storyUploadBundle(this)">
+        <input id="story-bundle-folder-input" type="file" webkitdirectory directory multiple
                style="display:none" onchange="storyUploadBundle(this)">
       </div>
 
@@ -4482,8 +4485,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
       <div class="story-actions" id="story-actions" style="display:none;">
         <button class="btn btn-p" onclick="storyBuild()">⬇ Generate Storyboard PDF</button>
-        <a class="btn btn-g btn-sm" id="story-download-link" href="/storyboard/download"
-           target="_blank" style="display:none;">Download last PDF</a>
+        <button class="btn btn-g btn-sm" id="story-download-link" style="display:none;"
+                onclick="storyDownloadLastPdf()">Download last PDF</button>
         <span class="story-status" id="story-status"></span>
       </div>
     </div>
@@ -4514,9 +4517,8 @@ document.addEventListener('DOMContentLoaded', () => {
       <div class="story-actions" id="story-replace-actions" style="display:none;">
         <button class="btn btn-g" onclick="storyReplacePreview()">↻ Refresh preview</button>
         <button class="btn btn-p" onclick="storyReplaceExport()">⬇ Export updated PDF</button>
-        <a class="btn btn-g btn-sm" id="story-replace-download-link"
-           href="/storyboard/replace-download" target="_blank"
-           style="display:none;">Download last updated PDF</a>
+        <button class="btn btn-g btn-sm" id="story-replace-download-link"
+                style="display:none;" onclick="storyDownloadReplacedPdf()">Download last updated PDF</button>
         <span class="story-status" id="story-replace-status"></span>
       </div>
 
@@ -4713,6 +4715,53 @@ async function busyFetch(url, opts, msg){
   setBusy(msg);
   try { return await fetch(url, opts); }
   finally { clearBusy(); }
+}
+
+// ── Save-As download helper ───────────────────────────────────────────────────
+// Wraps the modern File System Access API (showSaveFilePicker) so the user
+// gets a real "Save As" dialog where they pick the folder + filename. Falls
+// back to a regular download (browser default folder) on browsers without
+// support — Firefox + Safari today; Chromium-based browsers all have it.
+//
+// `extension` should include the leading dot (".zip", ".pdf"). MUST be called
+// from a user-gesture handler (button onclick) — browsers block the API
+// otherwise.
+async function downloadFile(url, suggestedName, mimeType, extension){
+  mimeType = mimeType || 'application/octet-stream';
+  // Path 1: Save As dialog (modern Chromium browsers)
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      const opts = { suggestedName: suggestedName };
+      if (extension) {
+        // The dialog's "Save as type" dropdown.
+        opts.types = [{
+          description: extension.replace(/^\./,'').toUpperCase() + ' file',
+          accept: { [mimeType]: [extension] }
+        }];
+      }
+      const handle = await window.showSaveFilePicker(opts);
+      setBusy('Downloading ' + suggestedName + '…');
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const writable = await handle.createWritable();
+      await resp.body.pipeTo(writable);
+      clearBusy();
+      return true;
+    } catch (e) {
+      clearBusy();
+      if (e && e.name === 'AbortError') return false;   // user cancelled
+      console.warn('Save dialog failed; falling back to direct link:', e);
+      // fall through to fallback
+    }
+  }
+  // Path 2: regular download (browser handles where to save)
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = suggestedName || '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  return true;
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────────
@@ -4981,9 +5030,10 @@ async function runCapture(){
 }
 async function openFolder(){
   // Hosted: download the zip the server prepared. The "Open" button is
-  // repurposed as "Download zip".
+  // repurposed as "Download zip" — opens a Save As dialog where supported.
   if(window._lastZipUrl){
-    window.location.href = window._lastZipUrl;
+    const name = (selectedPath || 'banner').split(/[\\\/]/).pop() + '_frames.zip';
+    await downloadFile(window._lastZipUrl, name, 'application/zip', '.zip');
   }
 }
 function appendLog(t){
@@ -5567,15 +5617,16 @@ async function mbRunAll(){
       mbAppendLog(msg.text + '\n');
     } else if(msg.type === 'done'){
       mbAppendLog('\n✓ All banners captured.\n');
-      // Hosted: surface a download link for the bundle zip.
+      // Hosted: surface a download button that opens a Save-As dialog.
       if(msg.zip){
         const zname = msg.zip.split('/').pop();
         const url   = '/download/' + encodeURIComponent(zname);
         mbAppendLog('Bundle zip ready — ');
-        const a = document.createElement('a');
-        a.href = url; a.textContent = 'click to download (' + zname + ')';
-        a.target = '_blank';
-        document.getElementById('mb-log').appendChild(a);
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-p btn-sm';
+        btn.textContent = '⬇ Save zip as… (' + zname + ')';
+        btn.onclick = () => downloadFile(url, zname, 'application/zip', '.zip');
+        document.getElementById('mb-log').appendChild(btn);
         mbAppendLog('\n');
       }
       document.getElementById('mb-runstatus').textContent = 'Complete ✓';
@@ -5627,19 +5678,34 @@ async function storyAutoLoad(){
 }
 
 async function storyUploadBundle(input){
-  // Hosted equivalent of the old "Load other bundle…" folder picker — accept
-  // a .zip the user previously downloaded from a Multi-Banner capture, and
-  // extract + scan it server-side.
+  // Hosted equivalent of the old folder-picker. Two paths:
+  //   - .zip mode (input #story-bundle-zip-input):    one file, .zip
+  //   - folder mode (input #story-bundle-folder-input): every file in the
+  //     folder, with webkitRelativePath preserved as the filename
   if(!input.files || !input.files.length) return;
-  const file = input.files[0];
-  storySetStatus('Uploading ' + file.name + ' ('
-               + (file.size/(1024*1024)).toFixed(1) + ' MB)…');
+  const isFolder = input.hasAttribute('webkitdirectory');
+  let totalBytes = 0;
+  for(const f of input.files){ totalBytes += f.size; }
+  const sizeMB = (totalBytes/(1024*1024)).toFixed(1);
+  if(isFolder){
+    storySetStatus('Uploading ' + input.files.length + ' files ('
+                 + sizeMB + ' MB)…');
+  } else {
+    storySetStatus('Uploading ' + input.files[0].name + ' ('
+                 + sizeMB + ' MB)…');
+  }
   const fd = new FormData();
-  fd.append('file', file, file.name);
+  for(const f of input.files){
+    // webkitRelativePath preserves the folder structure on folder uploads;
+    // for single .zip uploads it's empty so f.name is fine.
+    const fname = f.webkitRelativePath || f.name;
+    fd.append('file', f, fname);
+  }
   let d;
   try{
     const r = await busyFetch('/upload/storyboard-bundle',
-      {method:'POST', body: fd}, 'Uploading + extracting bundle…');
+      {method:'POST', body: fd},
+      isFolder ? 'Uploading + scanning folder…' : 'Uploading + extracting bundle…');
     d = await r.json();
   }catch(e){ storySetStatus('⚠ '+e.message, 'err'); return; }
   if(!d.ok){ storySetStatus('⚠ '+(d.error||'Upload failed'), 'err'); return; }
@@ -5647,6 +5713,8 @@ async function storyUploadBundle(input){
   storyBanners = (d.banners || []).map(b => Object.assign({notes: ['','','','']}, b));
   storyRender(d.bundle, storyBanners);
   storySetStatus('✓ Loaded: '+d.name, 'ok');
+  // Reset the input so re-selecting the same bundle re-triggers onchange.
+  input.value = '';
 }
 
 // Update the bundle thumbnail strip in BOTH storyboard modes — visual confirmation
@@ -5764,13 +5832,21 @@ async function storyBuild(){
   }catch(e){ storySetStatus('⚠ '+e.message, 'err'); return; }
   if(!d.ok){ storySetStatus('⚠ '+(d.error||'Failed'), 'err'); return; }
   storySetStatus('✓ PDF saved to bundle.', 'ok');
+  // Reveal the download button — user clicks to get the Save-As dialog.
+  document.getElementById('story-download-link').style.display = '';
+  // Suggest the bundle name as the default filename.
+  window._lastStoryboardName = (storyBanners && storyBundle
+                                  ? storyBundle.split('/').pop()
+                                  : 'storyboard') + '.pdf';
+  // Auto-trigger the download so they get immediate feedback (Save-As dialog
+  // pops up where supported).
+  storyDownloadLastPdf();
+}
 
-  // Fresh URL with a cache-bust so the browser doesn't reuse a stale PDF.
-  const link = document.getElementById('story-download-link');
-  link.href = '/storyboard/download?t=' + Date.now();
-  link.style.display = '';
-  // Auto-open the download to give immediate feedback
-  window.open(link.href, '_blank');
+async function storyDownloadLastPdf(){
+  const url = '/storyboard/download?t=' + Date.now();
+  const name = window._lastStoryboardName || 'storyboard.pdf';
+  await downloadFile(url, name, 'application/pdf', '.pdf');
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6730,10 +6806,17 @@ async function storyReplaceExport(){
   }catch(e){ replaceSetStatus('⚠ '+e.message, 'err'); return; }
   if(!d.ok){ replaceSetStatus('⚠ '+(d.error||'Export failed'), 'err'); return; }
   replaceSetStatus('✓ Updated PDF saved.', 'ok');
-  const link = document.getElementById('story-replace-download-link');
-  link.href = '/storyboard/replace-download?t=' + Date.now();
-  link.style.display = '';
-  window.open(link.href, '_blank');
+  document.getElementById('story-replace-download-link').style.display = '';
+  // Suggest a sensible default name based on the uploaded source PDF.
+  window._lastReplacedName = (window._replaceSourceName || 'storyboard') + '_updated.pdf';
+  // Auto-trigger the Save-As dialog now that export succeeded.
+  storyDownloadReplacedPdf();
+}
+
+async function storyDownloadReplacedPdf(){
+  const url = '/storyboard/replace-download?t=' + Date.now();
+  const name = window._lastReplacedName || 'storyboard_updated.pdf';
+  await downloadFile(url, name, 'application/pdf', '.pdf');
 }
 
 // ── CPFP (tab 6): change-proof full-proof ─────────────────────────────────
@@ -7433,55 +7516,71 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "filename": saved[0] if saved else None})
 
     def _upload_storyboard_bundle(self):
-        """Receive a previously-downloaded multi-banner capture bundle as a
-        .zip, extract it under sess.work_dir, and set sess.last_bundle so the
-        Storyboard tab picks it up.
+        """Receive a previously-captured multi-banner bundle and load it into
+        the Storyboard tab.
 
-        Replaces the old AppleScript folder-picker flow that asked for a
-        local path — hosted users now upload the zip they downloaded earlier.
+        Two upload modes are supported (auto-detected from what the browser
+        sends):
+          1. **Single .zip**       — extract into sess.work_dir, scan
+          2. **Folder upload**     — webkitdirectory sends every file in the
+                                     folder with the relative path encoded in
+                                     the filename; we save them preserving
+                                     that structure, then scan
+
+        Either way: sets sess.last_bundle to the discovered bundle root and
+        returns the banner list so the Storyboard UI picks it up.
         """
         sess = self.sess
         parts = self._read_multipart()
         files = [p for p in parts if p.get("filename")]
         if not files:
-            self._json({"ok": False, "error": "No file received."}); return
-        f = files[0]
-        if not (f["filename"] or "").lower().endswith(".zip"):
-            self._json({"ok": False, "error": "Please upload a .zip bundle."}); return
+            self._json({"ok": False, "error": "No file(s) received."}); return
 
-        # Save the zip into a fresh per-session subfolder, then extract.
+        # Single .zip → extract; anything else → treat as folder upload.
+        is_zip = (len(files) == 1
+                  and (files[0]["filename"] or "").lower().endswith(".zip"))
+
+        # Per-upload sandbox so successive loads don't clobber each other.
         bundles_root = sess.work_dir / "loaded-bundles"
         bundles_root.mkdir(parents=True, exist_ok=True)
-        # Use a unique subfolder per upload so successive loads don't collide.
         slot = f"b{int(time.monotonic()*1000) & 0xFFFFFF:x}"
         target = bundles_root / slot
         target.mkdir(parents=True, exist_ok=True)
-        zip_path = target / "_upload.zip"
-        zip_path.write_bytes(f["data"])
 
-        try:
-            with zipfile.ZipFile(zip_path) as zf:
-                # Defend against zip-slip (paths escaping target).
-                base = target.resolve()
-                for n in zf.namelist():
-                    out = (target / n).resolve()
-                    try:
-                        out.relative_to(base)
-                    except ValueError:
-                        self._json({"ok": False,
-                                    "error": "Bundle contained a path outside the upload folder."})
-                        return
-                zf.extractall(target)
-        except zipfile.BadZipFile:
-            self._json({"ok": False, "error": "Not a valid zip file."}); return
-        except Exception as e:
-            self._json({"ok": False, "error": f"Couldn't extract zip: {e}"}); return
-        finally:
-            zip_path.unlink(missing_ok=True)
+        if is_zip:
+            zip_path = target / "_upload.zip"
+            zip_path.write_bytes(files[0]["data"])
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    # Defend against zip-slip (paths escaping target).
+                    base = target.resolve()
+                    for n in zf.namelist():
+                        out = (target / n).resolve()
+                        try:
+                            out.relative_to(base)
+                        except ValueError:
+                            self._json({"ok": False,
+                                        "error": "Bundle contained a path outside the upload folder."})
+                            return
+                    zf.extractall(target)
+            except zipfile.BadZipFile:
+                self._json({"ok": False, "error": "Not a valid zip file."}); return
+            except Exception as e:
+                self._json({"ok": False, "error": f"Couldn't extract zip: {e}"}); return
+            finally:
+                zip_path.unlink(missing_ok=True)
+        else:
+            # Folder upload: webkitdirectory sends each file with the relative
+            # path encoded in `filename` (e.g. "myCapture/160x600/01_logo.png").
+            for p in files:
+                rel = _safe_subpath(p["filename"])
+                dest = target / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(p["data"])
 
-        # The downloaded bundle has shape:  <bundle_name>_capture/<size>/...
-        # First try the target itself; if that yields nothing, look one level
-        # deeper (a single subfolder = the bundle root inside the zip).
+        # The bundle layout is:  <bundle_name>/<size>/...   (PNG frames + isi_full.png)
+        # First scan the upload root; if that yields nothing, look one level
+        # deeper (a single subfolder = the bundle root inside the upload).
         candidate = target
         banners = _scan_capture_bundle(candidate)
         if not banners:
@@ -7491,7 +7590,7 @@ class Handler(BaseHTTPRequestHandler):
                 banners = _scan_capture_bundle(candidate)
         if not banners:
             self._json({"ok": False,
-                        "error": "No banner sub-folders with PNG frames found in the zip."})
+                        "error": "No banner sub-folders with PNG frames found in the upload."})
             return
         sess.last_bundle = candidate
         self._json({"ok": True, "bundle": str(candidate), "banners": banners,
