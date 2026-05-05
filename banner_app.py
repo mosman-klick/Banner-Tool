@@ -2088,8 +2088,10 @@ async def screenshot_at(banner_dir: Path, t: float) -> bytes:
 
 
 async def _open_page(browser, url, w=None, h=None, scale=3, record_dir=None):
-    if w is None: w = _banner_w
-    if h is None: h = _banner_h
+    # Sane defaults if the caller hasn't passed dimensions. Most callers
+    # detect the actual size from the loaded HTML and pass it in explicitly.
+    if w is None: w = 160
+    if h is None: h = 600
     opts = dict(viewport={"width": w, "height": h}, device_scale_factor=scale)
     if record_dir:
         opts["record_video_dir"] = str(record_dir)
@@ -2199,17 +2201,16 @@ async def capture_isi_png_studio(browser, studio_url, banner_dir, output_dir, lo
                 break
             await page.wait_for_timeout(500)
 
-        # Detect the actual banner width from inside the creative frame —
-        # don't trust the global `_banner_w` (which might be stale from a
-        # previous Frame Capture run). The Studio iframe has its own native
-        # creative size; we want the ISI panel to match the actual ISI panel
-        # — which on a 728×90 leaderboard is ~240px (a side column), not 728.
-        bw = _banner_w
+        # Detect the actual banner width from inside the creative frame.
+        # The Studio iframe has its own native creative size; we want the ISI
+        # panel to match the actual ISI panel — which on a 728×90 leaderboard
+        # is ~240px (a side column), not 728. Default to 160 if detection fails.
+        bw = 160
         if creative_frame is not None:
             try:
                 # Prefer ISI's natural rendered width (matches text-wrap on the
                 # real banner). Fall back to the banner's width if no ISI
-                # element is found yet, then to the global as last resort.
+                # element is found yet.
                 isi_w = await creative_frame.evaluate(DETECT_ISI_NATURAL_WIDTH_JS)
                 if isi_w and int(isi_w) > 0:
                     bw = int(isi_w)
@@ -2306,14 +2307,17 @@ async def capture_isi_png(browser, banner_path, output_dir, log):
     container to that ISI panel width. Padding-right and inner widths are left
     untouched so text wraps identically to the live banner.
     """
-    bw, bh = _banner_w, _banner_h
+    # Default to a small skyscraper viewport; the detection block below will
+    # resize once we've parsed the banner's actual ad.size. This used to read
+    # the module-level _banner_w / _banner_h globals which no longer exist —
+    # detection covers all real cases (Klick + DoubleClick both set ad.size
+    # or have a .banner element).
+    bw, bh = 160, 600
     ctx, page = await _open_page(browser, banner_path.as_uri(), w=bw + 400, h=bh + 400, scale=3)
     await page.wait_for_timeout(300)
 
     # Detect the actual banner width from the loaded HTML so the ISI panel
-    # ends up at the right size — even when the global `_banner_w` is stale
-    # (Multi-Banner Viewer iterates slots without updating it). Falls back to
-    # the global if the page has no ad.size meta and no `.banner` element.
+    # ends up at the right size for the slot we're capturing.
     detected_bw, detected_bh = None, None
     try:
         sz = await page.evaluate(DETECT_BANNER_SIZE_JS)
@@ -2619,12 +2623,13 @@ async def record_video(browser, banner_path, output_dir, log):
     # — Playwright fixes the recording viewport at context creation, and any
     # later page.set_viewport_size() doesn't resize the recording. So we read
     # the dimensions out of the HTML's <meta name="ad.size"> first (cheap,
-    # no browser needed). Falls back to the globals if the meta is missing.
+    # no browser needed). Falls back to a 160×600 skyscraper if detection
+    # fails (it almost never does for real banners).
     try:
         det_w, det_h = _get_banner_size(banner_path)
-        bw, bh = (det_w or _banner_w), (det_h or _banner_h)
+        bw, bh = (det_w or 160), (det_h or 600)
     except Exception:
-        bw, bh = _banner_w, _banner_h
+        bw, bh = 160, 600
 
     # Record at scale=1: device_scale_factor>1 makes Playwright render at
     # higher device-pixel density, but record_video_size is interpreted as
