@@ -1,5 +1,5 @@
 ---
-title: Banner Frame Capture
+title: Banner Tool
 emoji: 🎬
 colorFrom: blue
 colorTo: indigo
@@ -8,7 +8,7 @@ app_port: 7860
 pinned: false
 ---
 
-# Banner Frame Capture
+# Banner Tool
 
 Internal Klick tool for capturing frames, ISI images, MP4 videos, and
 storyboards from HTML banner ads.

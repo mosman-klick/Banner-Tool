@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Banner Frame Capture v3 — Local Web App
+Banner Tool — Hosted Web App (HF Spaces)
 • Load a banner folder OR paste a Ziflow proof URL
 • Preview the banner live and pick your own frame times
 • Export PNG frames + full ISI (image + copyable HTML)
@@ -352,6 +352,46 @@ def _ziflow_url_to_local(url: str) -> Path:
             pass  # 404s on optional/fallback files are harmless
 
     return tmp
+
+
+def _discover_ziflow_banners(proof_url: str) -> list:
+    """Walk a Ziflow proof page and return one entry per banner found.
+
+    Ziflow stores each rich-media banner as a folder on `proof-assets.ziflow.io`
+    keyed by an asset GUID. The single-banner path (`_ziflow_url_to_local`)
+    extracts only the og:image meta tag, which reflects the page's "primary"
+    banner. For multi-banner proofs (e.g. all sizes of the same campaign on
+    one proof page), every banner's asset GUID appears somewhere in the page
+    HTML — typically in iframe src URLs, thumbnail references, or embedded
+    JSON. We collect every unique `richMedia/<asset_guid>/...` URL we see.
+
+    Returns a list of {name, url, creative_id} dicts shaped like the other
+    discovery helpers (Klick, DoubleClick) so `_multi_load` can treat them
+    uniformly. Ordering preserves first-appearance in the HTML.
+    """
+    page = _http_get(proof_url).decode("utf-8", "replace")
+
+    # Match every richMedia URL on the page. Capture proof_guid + asset_guid +
+    # filename so we can build the index.html URL and dedupe by asset_guid.
+    pattern = re.compile(
+        r'https://proof-assets\.ziflow\.io/Proofs/'
+        r'([0-9a-f-]+)/richMedia/([0-9a-f-]+)/([^"\'\s\?#)]+)',
+        re.I,
+    )
+    seen = []   # preserve order; track asset_guids we've already added
+    seen_guids = set()
+    for proof_guid, asset_guid, filename in pattern.findall(page):
+        if asset_guid in seen_guids:
+            continue
+        seen_guids.add(asset_guid)
+        index_url = (f"https://proof-assets.ziflow.io/Proofs/{proof_guid}/"
+                     f"richMedia/{asset_guid}/index.html")
+        seen.append({
+            "name":        f"banner_{asset_guid[:8]}",
+            "url":         index_url,
+            "creative_id": asset_guid,
+        })
+    return seen
 
 
 def _doubleclick_url_to_local(url: str):
@@ -2820,7 +2860,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Banner Frame Capture v3</title>
+<title>Banner Tool</title>
 <style>
 /* ─── Theme tokens ───────────────────────────────────────────────────────
  * Each combo of {scheme, mode} declares the same set of variables, so the
@@ -3177,7 +3217,7 @@ body{
 .btn-g:not(:disabled):hover{background:var(--bg-hover);}
 .btn-sm{font-size:11px;padding:5px 10px;}
 .btn-full{width:100%;text-align:center;padding:10px;}
-input[type=text],input[type=number]{
+input[type=text],input[type=number],input[type=password]{
   flex:1;min-width:0;padding:8px 10px;border-radius:7px;
   border:1.5px solid var(--border-default);background:var(--bg-input);
   color:var(--text-primary);font-family:"Menlo",monospace;font-size:12px;outline:none;
@@ -4018,7 +4058,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </div>
 
 <div class="topbar">
-  <h1>Banner Frame Capture v3</h1>
+  <h1>Banner Tool</h1>
   <nav class="tabs">
     <button class="tab-btn active" data-tab="capture" onclick="switchTab('capture')">Frame Capture</button>
     <button class="tab-btn"        data-tab="isi"     onclick="switchTab('isi')">ISI Compare</button>
@@ -4386,8 +4426,11 @@ document.addEventListener('DOMContentLoaded', () => {
         <strong>Klick / AdPiler:</strong> use the password from the staging email — leave Username blank.<br>
         <strong>DoubleClick Studio</strong> (URLs starting with
         <code>www.google.com/doubleclick/studio/externalpreview</code>): no
-        login needed; just paste the URL and click Load. The app will cycle
-        through every creative in the dropdown automatically.<br>
+        login needed; just paste the URL and click Load. The app cycles
+        through every creative in the size dropdown.<br>
+        <strong>Ziflow proof</strong> (URLs like
+        <code>app.ziflow.io/proof/&lt;id&gt;</code>): no login needed; the app
+        finds every banner referenced on the proof page.<br>
         <strong>HTTP Basic Auth</strong> (browser popup asks for user+pass):
         fill both fields.
       </p>
@@ -7864,7 +7907,16 @@ class Handler(BaseHTTPRequestHandler):
         self._serve_banner(slot_info["dir"], f"/banner_multi/{slot}/")
 
     def _multi_load(self):
-        """Sign in to a Klick staging URL, find every banner, download each."""
+        """Discover every banner on the source URL and download each.
+
+        Three URL flavors are supported:
+          1. **Klick / AdPiler staging** — form-based password gate, banners
+             served via iframes on the same page (Playwright drives the auth).
+          2. **DoubleClick Studio external-preview** — no auth, single-page
+             dropdown (Playwright cycles through creative sizes).
+          3. **Ziflow proof URL** — public; HTML lists every banner's asset
+             GUID (no Playwright needed; faster than the others).
+        """
         sess = self.sess
         body = self._body()
         url  = (body.get("url") or "").strip()
@@ -7876,10 +7928,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # Route to the appropriate discovery handler based on URL pattern.
         try:
-            with PLAYWRIGHT_SEM:
-                if DOUBLECLICK_PREVIEW_RE.match(url):
+            if ZIFLOW_PROOF_RE.match(url):
+                # Ziflow is a static HTTP fetch — no Playwright needed, no semaphore.
+                banners = _discover_ziflow_banners(url)
+            elif DOUBLECLICK_PREVIEW_RE.match(url):
+                with PLAYWRIGHT_SEM:
                     banners = asyncio.run(_discover_doubleclick_banners(url))
-                else:
+            else:
+                with PLAYWRIGHT_SEM:
                     banners = asyncio.run(_discover_klick_banners(url, user, pwd))
         except Exception as e:
             err = str(e)
@@ -8676,7 +8732,7 @@ def main():
     # Hugging Face Spaces sets PORT=7860; locally the user can override it.
     port = int(os.environ.get("PORT", "7860"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"Banner Frame Capture listening on http://0.0.0.0:{port}",
+    print(f"Banner Tool listening on http://0.0.0.0:{port}",
           flush=True)
 
     # Background session janitor for hosted multi-user lifetimes.
