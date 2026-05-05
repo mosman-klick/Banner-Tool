@@ -13,6 +13,9 @@ pinned: false
 Internal Klick tool for capturing frames, ISI images, MP4 videos, and
 storyboards from HTML banner ads.
 
+**Live (private):** https://apexscireg-banner-capture.hf.space
+(only accessible to members of the **ApexSciReg** Hugging Face organization).
+
 ## Features
 
 - **Frame Capture** — load a banner from a Ziflow proof URL, DoubleClick
