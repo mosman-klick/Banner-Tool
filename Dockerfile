@@ -2,7 +2,12 @@
 # git push to the Space's `main` branch. Microsoft's Playwright base image
 # already has Chromium, ffmpeg, and every system library Chromium needs at
 # runtime — saves ~50 lines of `apt-get install` and avoids version drift.
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+#
+# CRITICAL: the pip-installed Playwright Python lib version MUST match the
+# browsers shipped in this base image. Pinning both to v1.59.0 to keep them
+# in lockstep — otherwise pip pulls a newer Playwright and chrome-headless-
+# shell goes missing at runtime.
+FROM mcr.microsoft.com/playwright/python:v1.59.0-jammy
 
 WORKDIR /app
 
@@ -12,7 +17,7 @@ WORKDIR /app
 # / imageio-ffmpeg are required by the existing capture / storyboard /
 # CPFP code paths.
 RUN pip install --no-cache-dir \
-        playwright \
+        playwright==1.59.0 \
         imageio-ffmpeg \
         pillow \
         pypdf \
