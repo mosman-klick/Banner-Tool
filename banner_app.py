@@ -745,9 +745,58 @@ async def _discover_ziflow_banners_async(proof_url: str, cookie_header: str = ""
                     "of the proof URL; (3) download the bundle from Ziflow "
                     "and load it on the Storyboard tab via 'Load folder…'.")
 
-            # Wait for the proof viewer to mount the banner iframe.
+            # Wait for the proof viewer to mount its outer iframe.
             await page.wait_for_selector(
                 ZIFLOW_BANNER_IFRAME_SELECTOR, state="attached", timeout=30_000)
+
+            # ── Mode A: "merged rich media" grid layout ──────────────────────
+            # Some Ziflow proofs (multi-file proofs with rich-media banners)
+            # render a SINGLE outer iframe pointing at
+            # /api/proof/token/<id>/merged-rich-media — which itself contains
+            # one nested <iframe src=…/richMedia/<asset_guid>/…> per banner.
+            # Detect this layout up front. If present, read every nested
+            # iframe src in one pass — no clicking needed.
+            outer_src = await page.evaluate(
+                f"() => {{ const f = document.querySelector('{ZIFLOW_BANNER_IFRAME_SELECTOR}'); "
+                f"return f && f.src ? f.src : ''; }}") or ""
+            if "merged-rich-media" in outer_src:
+                # Wait for the inner doc + nested iframes to load.
+                merged_urls = []
+                for _ in range(40):
+                    merged_urls = await page.evaluate(
+                        "() => { const f = document.querySelector('"
+                        + ZIFLOW_BANNER_IFRAME_SELECTOR + "'); "
+                        "if (!f) return []; "
+                        "let inner = null; try { inner = f.contentDocument; } catch (e) {} "
+                        "if (!inner) return []; "
+                        "const srcs = [...inner.querySelectorAll('iframe')]"
+                        ".map(i => i.src || '').filter(s => s && s.includes('richMedia')); "
+                        "return [...new Set(srcs)]; }") or []
+                    if merged_urls:
+                        break
+                    await page.wait_for_timeout(300)
+                src_re = re.compile(
+                    r"https://proof-assets\.ziflow\.io/Proofs/"
+                    r"([0-9a-f-]+)/richMedia/([0-9a-f-]+)/", re.I)
+                results = []
+                seen_guids = set()
+                for u in merged_urls:
+                    m = src_re.search(u)
+                    if not m:
+                        continue
+                    proof_guid, asset_guid = m.group(1), m.group(2)
+                    if asset_guid in seen_guids:
+                        continue
+                    seen_guids.add(asset_guid)
+                    results.append({
+                        "name":        f"banner_{asset_guid[:8]}",
+                        "url":         (f"https://proof-assets.ziflow.io/Proofs/{proof_guid}"
+                                        f"/richMedia/{asset_guid}/index.html"),
+                        "creative_id": asset_guid,
+                    })
+                if results:
+                    return results
+                # fall through to Mode B if merged extraction came up empty
             # Give the iframe a moment to set its src to the asset CDN URL
             # (Angular sets it after the wrapper appears).
             for _ in range(20):
@@ -5831,43 +5880,65 @@ function _bannerToolBookmarkletSource() {
        return;
      }
      const sleep = ms => new Promise(r => setTimeout(r, ms));
-     const ifrSrc = () => {
-       const f = document.querySelector('iframe[name^="ziflow-iframe-"]');
-       return f && f.src ? f.src : '';
-     };
+     const outerIframe = () => document.querySelector('iframe[name^="ziflow-iframe-"]');
      const nextBtn = () => document.querySelector('a[data-selector="asset-switcher-next"]');
      const isDisabled = el => el && (el.className||'').toLowerCase().includes('disabled');
 
-     // Wait up to 12s for the SPA to render the first banner.
+     // ── Mode A: "merged rich media" grid (multi-file proofs) ─────────────────
+     // The outer iframe loads /api/proof/token/<id>/merged-rich-media which
+     // itself contains one nested <iframe src=…/richMedia/<asset_guid>/…>
+     // per banner. Same domain, so we can reach into contentDocument.
+     function getMergedUrls() {
+       const f = outerIframe();
+       if (!f || !(f.src||'').includes('merged-rich-media')) return null;
+       try {
+         const inner = f.contentDocument;
+         if (!inner) return null;
+         const srcs = [...inner.querySelectorAll('iframe')]
+           .map(i => i.src).filter(s => s && s.includes('richMedia'));
+         return [...new Set(srcs)];
+       } catch (e) { return null; }
+     }
+
+     // Wait up to 12s for either layout to populate.
      for (let t = 0; t < 40; t++) {
-       const s = ifrSrc();
-       if (s && s.includes('richMedia')) break;
+       const merged = getMergedUrls();
+       if (merged && merged.length) break;
+       const f = outerIframe();
+       if (f && (f.src||'').includes('richMedia')) break;  // single-banner viewer
        await sleep(300);
      }
 
      const urls = [];
-     for (let i = 0; i < 30; i++) {        // safety cap well above realistic banner count
-       // Capture this banner's iframe src.
-       let src = '';
-       for (let t = 0; t < 40; t++) {
-         src = ifrSrc();
-         if (src && src.includes('richMedia')) break;
-         await sleep(300);
+     const merged = getMergedUrls();
+     if (merged && merged.length) {
+       merged.forEach(u => { if (!urls.includes(u)) urls.push(u); });
+     } else {
+       // ── Mode B: 1-of-N single-banner viewer ─────────────────────────────
+       const ifrSrc = () => {
+         const f = outerIframe();
+         return f && f.src ? f.src : '';
+       };
+       for (let i = 0; i < 30; i++) {
+         let src = '';
+         for (let t = 0; t < 40; t++) {
+           src = ifrSrc();
+           if (src && src.includes('richMedia')) break;
+           await sleep(300);
+         }
+         if (src && !urls.includes(src)) urls.push(src);
+         const nb = nextBtn();
+         if (!nb || isDisabled(nb)) break;
+         const prev = src;
+         nb.click();
+         let changed = false;
+         for (let t = 0; t < 40; t++) {
+           const x = ifrSrc();
+           if (x && x !== prev) { changed = true; break; }
+           await sleep(300);
+         }
+         if (!changed) break;
        }
-       if (src && !urls.includes(src)) urls.push(src);
-
-       // Advance to next banner. Done when Next is disabled or click does not advance.
-       const nx = nextBtn();
-       if (!nx || isDisabled(nx)) break;
-       const prev = src;
-       nx.click();
-       let changed = false;
-       for (let t = 0; t < 40; t++) {
-         const n = ifrSrc();
-         if (n && n !== prev) { changed = true; break; }
-         await sleep(300);
-       }
-       if (!changed) break;
      }
 
      if (!urls.length) {
@@ -5881,17 +5952,25 @@ function _bannerToolBookmarkletSource() {
   const code =
     "(async()=>{if(!/ziflow\\.io\\/proof\\//.test(location.href)){alert('Open a Ziflow proof page first, then click this bookmark.');return;}" +
     "const sleep=ms=>new Promise(r=>setTimeout(r,ms));" +
-    "const ifr=()=>{const f=document.querySelector('iframe[name^=\"ziflow-iframe-\"]');return f&&f.src?f.src:'';};" +
-    "const nx=()=>document.querySelector('a[data-selector=\"asset-switcher-next\"]');" +
+    "const oI=()=>document.querySelector('iframe[name^=\"ziflow-iframe-\"]');" +
+    "const nb=()=>document.querySelector('a[data-selector=\"asset-switcher-next\"]');" +
     "const dis=e=>e&&(e.className||'').toLowerCase().includes('disabled');" +
-    "for(let t=0;t<40;t++){const s=ifr();if(s&&s.includes('richMedia'))break;await sleep(300);}" +
-    "const urls=[];for(let i=0;i<30;i++){let src='';" +
+    "function gM(){const f=oI();if(!f||!(f.src||'').includes('merged-rich-media'))return null;" +
+    "try{const ic=f.contentDocument;if(!ic)return null;" +
+    "const ss=[...ic.querySelectorAll('iframe')].map(i=>i.src).filter(s=>s&&s.includes('richMedia'));" +
+    "return[...new Set(ss)];}catch(e){return null;}}" +
+    "for(let t=0;t<40;t++){const m=gM();if(m&&m.length)break;" +
+    "const f=oI();if(f&&(f.src||'').includes('richMedia'))break;await sleep(300);}" +
+    "const urls=[];const merged=gM();" +
+    "if(merged&&merged.length){merged.forEach(u=>{if(!urls.includes(u))urls.push(u);});}" +
+    "else{const ifr=()=>{const f=oI();return f&&f.src?f.src:'';};" +
+    "for(let i=0;i<30;i++){let src='';" +
     "for(let t=0;t<40;t++){src=ifr();if(src&&src.includes('richMedia'))break;await sleep(300);}" +
     "if(src&&!urls.includes(src))urls.push(src);" +
-    "const n=nx();if(!n||dis(n))break;" +
+    "const n=nb();if(!n||dis(n))break;" +
     "const prev=src;n.click();" +
     "let changed=false;for(let t=0;t<40;t++){const x=ifr();if(x&&x!==prev){changed=true;break;}await sleep(300);}" +
-    "if(!changed)break;}" +
+    "if(!changed)break;}}" +
     "if(!urls.length){alert(\"Couldn't find any banners on this Ziflow proof.\\n\\nMake sure: (1) you're on a proof page (URL contains /proof/<id>); (2) you're signed in to Ziflow; (3) the proof has at least one banner.\");return;}" +
     "window.open(" + JSON.stringify(APP_HOST) + "+'/?ml='+encodeURIComponent(urls.join('\\n')),'_blank');})();";
   return 'javascript:' + code;
