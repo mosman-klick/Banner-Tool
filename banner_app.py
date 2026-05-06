@@ -3173,28 +3173,67 @@ async def run_all(banner_path, output_dir, frames,
 
 BANNER_INJECT = """<script>
 (function(){
+  // Banner-side controller: bridges the parent's Live Preview controls
+  // (play / pause / scrub / restart) to the banner's GSAP timeline `tl`.
+  //
+  // Two important correctness rules:
+  //
+  //  1. We DON'T send 'ready' until tl has tweens (duration > 0). Sending
+  //     duration=0 made the parent fall back to a hard-coded 20s scrubber
+  //     range — fine when the real duration is 20, badly off if it's
+  //     anything else.
+  //
+  //  2. As soon as tl.duration() becomes nonzero, we call tl.pause(0)
+  //     once. The banner's own startAnim() typically fires tl.play()
+  //     during onComplete; that's fine for live previews of a finished
+  //     ad, but for a TOOL where the user wants to scrub to a specific
+  //     time and capture, the banner should load PAUSED at t=0.
   function init(){
     if(typeof tl==='undefined'){setTimeout(init,200);return;}
-    // Tell parent the total duration so it can size the scrubber
-    try{ window.parent.postMessage({bc:'ready',duration:tl.duration()},'*'); }catch(e){}
-    window.addEventListener('message',function(e){
-      if(!e.data||!e.data.bc)return;
-      var d=e.data;
+    var sentReady = false;
+    var didAutoPause = false;
+    function maybeReady(){
+      if(sentReady) return;
+      var dur = 0;
+      try{ dur = tl.duration() || 0; }catch(e){}
+      if(dur > 0){
+        try{ window.parent.postMessage({bc:'ready', duration: dur}, '*'); }catch(e){}
+        sentReady = true;
+      }
+    }
+    function maybeAutoPause(){
+      if(didAutoPause) return;
+      var dur = 0;
+      try{ dur = tl.duration() || 0; }catch(e){}
+      if(dur > 0){
+        try{ tl.pause(0); }catch(e){}
+        didAutoPause = true;
+      }
+    }
+    window.addEventListener('message', function(e){
+      if(!e.data || !e.data.bc) return;
+      var d = e.data;
       if(d.bc==='play')   tl.play();
-      if(d.bc==='pause')  {tl.pause();if(typeof scrollTL!=='undefined')scrollTL.pause();}
-      if(d.bc==='restart'){tl.restart();if(typeof scrollTL!=='undefined'){scrollTL.kill();scrollTL=gsap.timeline({paused:true});}}
-      if(d.bc==='seek')   {tl.pause(d.time);if(typeof scrollTL!=='undefined')scrollTL.pause();}
+      if(d.bc==='pause')  {tl.pause(); if(typeof scrollTL!=='undefined') scrollTL.pause();}
+      if(d.bc==='restart'){tl.restart(); tl.pause(0);
+                           if(typeof scrollTL!=='undefined'){scrollTL.kill(); scrollTL=gsap.timeline({paused:true});}}
+      if(d.bc==='seek')   {tl.pause(d.time); if(typeof scrollTL!=='undefined') scrollTL.pause();}
     });
     setInterval(function(){
       try{
+        // Re-evaluate duration each tick — banners that build their
+        // timeline asynchronously (preload → window.onload → startAnim)
+        // start with duration=0 and grow to the real value.
+        maybeReady();
+        maybeAutoPause();
         window.parent.postMessage({
-          bc:'state',
-          time:    tl.time(),
-          duration:tl.duration(),
-          paused:  tl.paused()
-        },'*');
+          bc: 'state',
+          time:     tl.time(),
+          duration: tl.duration(),
+          paused:   tl.paused()
+        }, '*');
       }catch(e){}
-    },80);
+    }, 80);
   }
   init();
 })();
@@ -5514,9 +5553,13 @@ function scrubEnd(){ scrubbing=false; }
 window.addEventListener('message',function(e){
   if(!e.data||!e.data.bc) return;
   if(e.data.bc==='ready'){
-    animDuration = e.data.duration||20;
+    if(e.data.duration && e.data.duration > 0) animDuration = e.data.duration;
   }
   if(e.data.bc==='state'){
+    // Always trust the iframe's current tl.duration() — the timeline can
+    // grow after the banner's startAnim() finishes adding tweens, which
+    // happens after the initial 'ready' fired with duration=0.
+    if(e.data.duration && e.data.duration > 0) animDuration = e.data.duration;
     currentTime = e.data.time||0;
     document.getElementById('time-disp').textContent='t = '+currentTime.toFixed(2)+' s';
     if(!scrubbing && animDuration>0){
