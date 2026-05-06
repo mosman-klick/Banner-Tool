@@ -4387,12 +4387,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const params = new URLSearchParams(window.location.search);
     const ml = params.get('ml');
     if (ml) {
-      // Switch to the Multi-Banner Viewer tab.
+      // Pre-fill BOTH tabs so the user can choose which workflow they want:
+      //   - Multi-Banner Viewer: bulk capture (auto-loads here, default)
+      //   - Frame Capture:       inspect / scrub / capture frames per banner
+      // Frame Capture's URL textarea accepts the multi-line list and shows
+      // a size dropdown after the user clicks Load on that tab.
+      const fcUrl = document.getElementById('url-input');
+      if (fcUrl) fcUrl.value = ml;
+      // Switch to the Multi-Banner Viewer tab + auto-fire its load.
       try { switchTab('multi'); } catch (e) {}
-      const urlBox = document.getElementById('mb-url');
-      if (urlBox) {
-        urlBox.value = ml;
-        // Fire the existing load flow after the tab is visible.
+      const mbUrl = document.getElementById('mb-url');
+      if (mbUrl) {
+        mbUrl.value = ml;
         setTimeout(() => { try { mbLoad(); } catch (e) {} }, 100);
       }
       // Clean the URL so a refresh doesn't re-trigger.
@@ -4488,12 +4494,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
       <p class="src-divider">— or —</p>
 
-      <!-- Ziflow / DoubleClick URL -->
-      <p class="src-label">Ziflow proof URL or DoubleClick Studio preview URL</p>
+      <!-- Ziflow / DoubleClick URL — textarea so the bookmarklet's multi-line
+           asset-URL paste works here too (private Klick Ziflow proofs that
+           the server can't discover anonymously). -->
+      <p class="src-label">Ziflow proof URL, DoubleClick preview URL, or paste multiple asset URLs</p>
       <div class="row">
-        <input id="url-input" type="text"
-               placeholder="https://….ziflow.io/proof/… or https://www.google.com/doubleclick/studio/externalpreview/…"
-               onkeydown="if(event.key==='Enter')commitPath(this.value)">
+        <textarea id="url-input" rows="1"
+               placeholder="https://….ziflow.io/proof/… &#10;OR https://www.google.com/doubleclick/studio/externalpreview/… &#10;OR https://proof-assets.ziflow.io/Proofs/.../richMedia/.../index.html (one per line)"
+               style="resize:none;min-height:34px;font-family:Menlo,monospace;font-size:12px;padding:8px 10px;border-radius:7px;border:1.5px solid var(--border-default);background:var(--bg-input);color:var(--text-primary);outline:none;"
+               onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();commitPath(this.value);}"></textarea>
         <button class="btn btn-p btn-sm" id="url-btn"
                 onclick="commitPath(document.getElementById('url-input').value)">Load</button>
       </div>
@@ -5375,16 +5384,19 @@ async function commitPath(p, creativeIndex){
     _bothInputs().forEach(i => i.classList.remove('ok'));
     _activeInput(p).classList.add('ok');
     let badge = '';
-    if(data.doubleclick){
-      const dc = data.doubleclick;
-      badge = '  — DoubleClick · loaded ' + dc.picked_name
-            + (dc.total_count > 1
-                ? ' (' + ((dc.picked_index || 0) + 1) + ' of ' + dc.total_count + ')'
+    // The size dropdown handles three sources uniformly: DoubleClick Studio
+    // (`data.doubleclick`), multi-asset paste from the bookmarklet for
+    // private Klick Ziflow proofs (`data.multi_banners`), and single-banner
+    // URLs (no dropdown).
+    const picker = data.doubleclick || data.multi_banners;
+    if(picker){
+      const label = data.doubleclick ? 'DoubleClick' : 'Ziflow';
+      badge = '  — ' + label + ' · loaded ' + picker.picked_name
+            + (picker.total_count > 1
+                ? ' (' + ((picker.picked_index || 0) + 1) + ' of ' + picker.total_count + ')'
                 : '');
-      // Populate / show the size picker the first time we see this URL.
-      _renderDcPicker(dc);
+      _renderDcPicker(picker);
     } else {
-      // Hide picker for non-DoubleClick or single-creative URLs.
       const wrap = document.getElementById('dc-picker-wrap');
       if(wrap) wrap.style.display = 'none';
       window._dcCreatives = null;
@@ -8305,17 +8317,57 @@ class Handler(BaseHTTPRequestHandler):
         sess = self.sess
         body = self._body()
         raw  = body.get("path", "").strip()
-        # Optional: when re-validating a DoubleClick URL to pick a different
-        # creative size from the dropdown, the frontend sends the same URL
-        # plus `creative_index`. We use the cached discovery (sess.dc_cache)
-        # to avoid re-running the slow Playwright cycle.
+        # Optional: when re-validating to pick a different size from the
+        # dropdown, the frontend sends the same input plus `creative_index`.
+        # For DoubleClick URLs we use the cached creative list; for Ziflow
+        # multi-asset paste we just pick the Nth URL from the same list.
         creative_index = int(body.get("creative_index") or 0)
 
         dc_info = None  # extras to surface in the response if it's a DoubleClick URL
         studio_url = None  # Studio preview URL for the picked creative (DoubleClick only)
+        multi_banners = None  # list of {name, url, creative_id} for the size dropdown
 
+        # ── Multi-asset paste (newline-separated proof-assets.ziflow.io URLs) ──
+        # The bookmarklet drops these into the field for private Klick proofs.
+        # Same shape as DoubleClick's `creatives` so the frontend can populate
+        # the size dropdown identically.
+        manual = _parse_ziflow_asset_urls(raw)
+        if manual:
+            try:
+                if not (0 <= creative_index < len(manual)):
+                    creative_index = 0
+                picked = manual[creative_index]
+                folder = _download_banner_authed(picked["url"], "", "")
+            except Exception as e:
+                self._json({"ok": False, "error": f"Couldn't download asset URL: {e}"})
+                return
+            html = folder / "index.html"
+            is_remote = True
+            # Resolve a friendly name (size) per banner so the dropdown shows
+            # "160x600" rather than the raw "banner_2cca91a5". Sized banners
+            # also need this to render correctly via the existing UI logic.
+            sized = []
+            for i, b in enumerate(manual):
+                # We only know the size for the picked one (we just downloaded
+                # it); for the others we'll show the truncated guid.
+                if i == creative_index:
+                    try:
+                        w, h = _get_banner_size(folder / "index.html")
+                        sized.append({**b, "name": f"{w}x{h}", "size": f"{w}x{h}"})
+                    except Exception:
+                        sized.append({**b, "size": None})
+                else:
+                    sized.append({**b, "size": None})
+            multi_banners = {
+                "picked_index": creative_index,
+                "total_count":  len(manual),
+                "creatives":    sized,
+                "all_sizes":    [b.get("size") or b["name"] for b in sized],
+                "picked_name":  sized[creative_index].get("size")
+                                or sized[creative_index]["name"],
+            }
         # Ziflow proof URL? Download the assets to a temp folder first.
-        if ZIFLOW_PROOF_RE.match(raw):
+        elif ZIFLOW_PROOF_RE.match(raw):
             try:
                 folder = _ziflow_url_to_local(raw)
             except Exception as e:
@@ -8366,6 +8418,10 @@ class Handler(BaseHTTPRequestHandler):
                        "is_remote": is_remote}
             if dc_info:
                 payload["doubleclick"] = dc_info
+            if multi_banners:
+                # Same shape as `doubleclick` — frontend's _renderDcPicker
+                # treats both keys identically so the size dropdown shows.
+                payload["multi_banners"] = multi_banners
             self._json(payload)
         else:
             self._json({"ok": False, "error": f"No index.html in: {raw}"})
