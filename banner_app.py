@@ -356,6 +356,28 @@ def _ziflow_url_to_local(url: str) -> Path:
     return tmp
 
 
+def _peek_banner_size(url: str) -> tuple:
+    """Quick HTTP fetch of just the first 8 KB of a banner's index.html and
+    parse `<meta name="ad.size" content="width=W,height=H">` out of it.
+    Used to populate the size dropdown for a multi-asset paste WITHOUT having
+    to download every banner's full asset folder. Returns (w, h) or None.
+    """
+    try:
+        req = urllib.request.Request(url, headers=_UA_HEADERS)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = resp.read(8 * 1024).decode("utf-8", errors="replace")
+        m = re.search(
+            r'<meta\s+name=["\']ad\.size["\']\s+content=["\']'
+            r'width\s*=\s*(\d+)\s*,\s*height\s*=\s*(\d+)["\']',
+            data, re.I,
+        )
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
 def _parse_ziflow_asset_urls(text: str) -> list:
     """Detect a paste of one or more Ziflow asset CDN URLs and parse them.
 
@@ -8350,21 +8372,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
             html = folder / "index.html"
             is_remote = True
-            # Resolve a friendly name (size) per banner so the dropdown shows
-            # "160x600" rather than the raw "banner_2cca91a5". Sized banners
-            # also need this to render correctly via the existing UI logic.
-            sized = []
-            for i, b in enumerate(manual):
-                # We only know the size for the picked one (we just downloaded
-                # it); for the others we'll show the truncated guid.
-                if i == creative_index:
-                    try:
-                        w, h = _get_banner_size(folder / "index.html")
-                        sized.append({**b, "name": f"{w}x{h}", "size": f"{w}x{h}"})
-                    except Exception:
-                        sized.append({**b, "size": None})
-                else:
-                    sized.append({**b, "size": None})
+            # Resolve a friendly size label per banner so the dropdown shows
+            # "160x600" rather than the raw asset_guid. We already have the
+            # picked banner downloaded (read its meta from disk); for the
+            # others, peek the first 8 KB of each index.html in parallel and
+            # parse the <meta name="ad.size"> tag. Total cost: ~5-10 KB per
+            # other banner over HTTP, parallel — typically sub-second.
+            from concurrent.futures import ThreadPoolExecutor
+            sized = [dict(b) for b in manual]
+            try:
+                w, h = _get_banner_size(folder / "index.html")
+                sized[creative_index]["size"] = f"{w}x{h}"
+                sized[creative_index]["name"] = f"{w}x{h}"
+            except Exception:
+                pass
+            other_indices = [i for i in range(len(manual)) if i != creative_index]
+            if other_indices:
+                with ThreadPoolExecutor(max_workers=min(8, len(other_indices))) as ex:
+                    futs = {i: ex.submit(_peek_banner_size, manual[i]["url"])
+                            for i in other_indices}
+                    for i, fut in futs.items():
+                        size = None
+                        try:
+                            size = fut.result(timeout=10)
+                        except Exception:
+                            size = None
+                        if size:
+                            w, h = size
+                            sized[i]["size"] = f"{w}x{h}"
+                            sized[i]["name"] = f"{w}x{h}"
             multi_banners = {
                 "picked_index": creative_index,
                 "total_count":  len(manual),
