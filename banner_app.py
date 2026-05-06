@@ -327,11 +327,13 @@ def _ziflow_url_to_local(url: str) -> Path:
         shutil.rmtree(tmp, ignore_errors=True)
         raise ValueError("index.html not found at the Ziflow asset URL.")
 
-    # Discover relative file references in HTML (href/src) and CSS (url(...))
+    # Discover relative file references in HTML (href/src — both quote styles)
+    # and CSS (url(...)). Also catch DoubleClick Studio's polite-load pattern
+    # `data-src="..."` which Enabler swaps to real <img src> at runtime.
     refs = set()
-    refs.update(re.findall(
-        r'(?:href|src)="([^"#:?]+)"',
-        (tmp / "index.html").read_text(encoding="utf-8", errors="replace")))
+    html_text = (tmp / "index.html").read_text(encoding="utf-8", errors="replace")
+    refs.update(re.findall(r'(?:href|src|data-src)\s*=\s*"([^"#:?]+)"', html_text))
+    refs.update(re.findall(r"(?:href|src|data-src)\s*=\s*'([^'#:?]+)'", html_text))
     if (tmp / "style.css").exists():
         refs.update(re.findall(
             r"url\(['\"]?([^'\")]+)['\"]?\)",
@@ -1054,9 +1056,15 @@ def _download_banner_authed(index_url: str, user: str, password: str) -> Path:
     except Exception:
         pass
 
+    # Discover relative refs in HTML (href/src — both quote styles, plus
+    # `data-src` used by DoubleClick Studio's Enabler polite-load pattern)
+    # and CSS (url(...)). Single-quote attribute values (`src='sticker.png'`)
+    # used to be missed entirely — that's how a banner could end up with a
+    # broken image of its main artwork tile.
     refs = set()
-    refs.update(re.findall(r'(?:href|src)="([^"#:?]+)"',
-                           (tmp / "index.html").read_text(encoding="utf-8", errors="replace")))
+    html_text = (tmp / "index.html").read_text(encoding="utf-8", errors="replace")
+    refs.update(re.findall(r'(?:href|src|data-src)\s*=\s*"([^"#:?]+)"', html_text))
+    refs.update(re.findall(r"(?:href|src|data-src)\s*=\s*'([^'#:?]+)'", html_text))
     if (tmp / "style.css").exists():
         refs.update(re.findall(r"url\(['\"]?([^'\")]+)['\"]?\)",
                                (tmp / "style.css").read_text(encoding="utf-8", errors="replace")))
