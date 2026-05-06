@@ -436,28 +436,45 @@ def _discover_ziflow_banners(proof_url: str) -> list:
     return seen
 
 
-def _doubleclick_url_to_local(url: str):
-    """Open a DoubleClick Studio external-preview URL, pick the first creative
-    in the size dropdown, download its files to a temp folder. Returns
-    (folder_Path, info_dict). info_dict has `picked_name`, `total_count`,
-    `all_sizes`. Used by the Frame Capture and Banner Compare tabs which
-    only handle one banner at a time. The Multi-Banner Viewer uses the
-    full `_discover_doubleclick_banners` helper directly to load all sizes.
+def _doubleclick_url_to_local(url: str, picked_index: int = 0,
+                              cached_banners: list = None):
+    """Open a DoubleClick Studio external-preview URL, pick a creative from
+    the size dropdown (the first by default, or `picked_index`-th), download
+    its files to a temp folder. Returns (folder_Path, info_dict).
+
+    info_dict has:
+      - `picked_name`   — the chosen creative's display name (e.g. "160x600")
+      - `picked_index`  — its index in the size dropdown
+      - `total_count`   — total creatives on the page
+      - `all_sizes`     — list of every creative's display name
+      - `creatives`     — full discovery list (name + creative_id + url + size).
+                          Sent back so the frontend can populate a banner-
+                          size dropdown without re-discovering.
+      - `studio_url`    — Studio preview URL pinned to the chosen creative
+                          (used by capture_isi_png_studio to source the live
+                          ISI panel — the bare s0.2mdn.net creative loaded
+                          standalone doesn't render its ISI).
+
+    Pass `cached_banners` (the list returned by an earlier call's
+    `info["creatives"]`) to skip re-discovery — useful for the
+    pick-different-creative flow where the user clicks the dropdown and we
+    just need to download a different one.
     """
     import asyncio
-    banners = asyncio.run(_discover_doubleclick_banners(url))
+    banners = cached_banners or asyncio.run(_discover_doubleclick_banners(url))
     if not banners:
         raise ValueError("No creatives found on this DoubleClick page.")
-    first = banners[0]
-    folder = _download_banner_authed(first["url"], "", "")
+    if not (0 <= picked_index < len(banners)):
+        picked_index = 0
+    picked = banners[picked_index]
+    folder = _download_banner_authed(picked["url"], "", "")
     info = {
-        "picked_name":  first["name"],
+        "picked_name":  picked["name"],
+        "picked_index": picked_index,
         "total_count":  len(banners),
         "all_sizes":    [b["name"] for b in banners],
-        # Studio URL for the picked creative — used by capture_isi_png_studio so
-        # the ISI is sourced from the live Studio preview (the bare s0.2mdn.net
-        # creative loaded standalone doesn't render its ISI panel).
-        "studio_url":   _studio_url_for_creative(url, first["creative_id"]),
+        "creatives":    banners,    # full list for client-side dropdown
+        "studio_url":   _studio_url_for_creative(url, picked["creative_id"]),
     }
     return folder, info
 
@@ -4481,6 +4498,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 onclick="commitPath(document.getElementById('url-input').value)">Load</button>
       </div>
 
+      <!-- Banner-size picker — appears only when the loaded URL has multiple
+           creatives (DoubleClick Studio with N sizes). Switching reloads the
+           preview iframe with the chosen creative. -->
+      <div id="dc-picker-wrap" class="row" style="display:none;margin-top:8px;align-items:center;gap:8px;">
+        <label style="font-size:11px;color:var(--text-secondary);letter-spacing:.04em;">SIZE</label>
+        <select id="dc-picker"
+                style="flex:1;padding:6px 8px;border-radius:7px;border:1.5px solid var(--border-default);background:var(--bg-input);color:var(--text-primary);font-family:Menlo,monospace;font-size:12px;"
+                onchange="onDcPickerChange()"></select>
+      </div>
+
       <p id="pstatus"></p>
       <p class="hint">
         For local: hold <strong>Option</strong> + right-click folder in Finder →
@@ -4488,12 +4515,14 @@ document.addEventListener('DOMContentLoaded', () => {
       </p>
     </div>
 
-    <!-- Export options -->
+    <!-- Export options — match the Multi-Banner Viewer's 4-checkbox layout. -->
     <div class="card export-opts">
       <p class="card-title">Export Options</p>
-      <div class="check-row">
-        <label><input type="checkbox" id="opt-frames" checked> PNG frames + ISI</label>
-        <label><input type="checkbox" id="opt-video"  checked> MP4 video</label>
+      <div class="check-row" style="flex-direction:column;align-items:flex-start;gap:6px;">
+        <label><input type="checkbox" id="opt-frames"   checked> Frames (PNG stills at the times below)</label>
+        <label><input type="checkbox" id="opt-isi-png"  checked> ISI image</label>
+        <label><input type="checkbox" id="opt-isi-html" checked> ISI HTML</label>
+        <label><input type="checkbox" id="opt-video"    checked> MP4 video</label>
       </div>
       <button class="btn btn-p btn-full" id="run-btn" disabled onclick="runCapture()">
         Run Capture
@@ -5320,19 +5349,25 @@ function _bothInputs(){
   return [document.getElementById('folder-input'),
           document.getElementById('url-input')];
 }
-async function commitPath(p){
+async function commitPath(p, creativeIndex){
+  // creativeIndex is optional — passed when re-validating a DoubleClick URL
+  // to pick a different size from the dropdown.
   p = p.trim().replace(/\/+$/,'');
   if(!p)return;
   const isUrl = /^https?:\/\//i.test(p);
   const isDoubleClick = /google\.com\/doubleclick\/studio\/externalpreview/i.test(p);
   if(isUrl){
     setStatus(isDoubleClick
-      ? 'Loading DoubleClick preview (cycling through creatives — ~15 s)…'
+      ? (creativeIndex != null
+          ? 'Switching to ' + (window._dcCreatives && window._dcCreatives[creativeIndex] ? window._dcCreatives[creativeIndex].name : 'creative #' + creativeIndex) + '…'
+          : 'Loading DoubleClick preview (cycling through creatives — ~15 s)…')
       : 'Downloading from Ziflow…', '');
   }
+  const payload = {path: p};
+  if(creativeIndex != null) payload.creative_index = creativeIndex;
   const data = await (await busyFetch('/validate', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({path:p})
+    body: JSON.stringify(payload)
   }, isUrl ? 'Downloading banner from URL…' : 'Validating banner folder…')).json();
   if(data.ok){
     selectedPath = p;
@@ -5344,10 +5379,16 @@ async function commitPath(p){
       const dc = data.doubleclick;
       badge = '  — DoubleClick · loaded ' + dc.picked_name
             + (dc.total_count > 1
-                ? ' (1 of ' + dc.total_count + ' — others: ' + dc.all_sizes.slice(1).join(', ') + ')'
+                ? ' (' + ((dc.picked_index || 0) + 1) + ' of ' + dc.total_count + ')'
                 : '');
-    } else if(isRemote){
-      badge = '  — Ziflow';
+      // Populate / show the size picker the first time we see this URL.
+      _renderDcPicker(dc);
+    } else {
+      // Hide picker for non-DoubleClick or single-creative URLs.
+      const wrap = document.getElementById('dc-picker-wrap');
+      if(wrap) wrap.style.display = 'none';
+      window._dcCreatives = null;
+      if(isRemote) badge = '  — Ziflow';
     }
     setStatus('✓  '+data.name+' ('+data.width+'×'+data.height+')' + badge, 'ok');
     document.getElementById('run-btn').disabled=false;
@@ -5359,12 +5400,9 @@ async function commitPath(p){
     const frame = document.getElementById('banner-frame');
     shell.style.width=bw; shell.style.height=bh;
     frame.style.width=bw; frame.style.height=bh;
-    frame.src = '/banner/index.html';
+    // Cache-bust so the iframe reloads when we switch creatives.
+    frame.src = '/banner/index.html?t=' + Date.now();
     appendLog('Loaded: '+p+' ('+data.width+'×'+data.height+')' + badge + '\n');
-    if(data.doubleclick && data.doubleclick.total_count > 1){
-      appendLog('Note: this DoubleClick preview has ' + data.doubleclick.total_count
-              + ' sizes. To capture all of them at once, use the Multi-Banner Viewer tab.\n');
-    }
   }else{
     _bothInputs().forEach(i => i.classList.remove('ok'));
     setStatus(data.error||'No index.html found.','err');
@@ -5372,6 +5410,41 @@ async function commitPath(p){
     document.getElementById('preview-panel').style.display='none';
     document.getElementById('empty-state').style.display='flex';
   }
+}
+
+// Build the size dropdown from DoubleClick discovery info. `dc.all_sizes`
+// is an array of names (e.g. ['160x600', '300x250', ...]); `dc.picked_index`
+// is the currently-loaded creative's position in that list.
+function _renderDcPicker(dc){
+  const wrap = document.getElementById('dc-picker-wrap');
+  const sel  = document.getElementById('dc-picker');
+  if(!wrap || !sel) return;
+  if(!dc.total_count || dc.total_count < 2){
+    wrap.style.display = 'none';
+    window._dcCreatives = null;
+    return;
+  }
+  // Cache the creative names so onDcPickerChange can show user-readable
+  // status while the swap is in flight.
+  window._dcCreatives = (dc.all_sizes || []).map((name, i) => ({ name, index: i }));
+  sel.innerHTML = '';
+  (dc.all_sizes || []).forEach((name, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = name;
+    if(i === (dc.picked_index || 0)) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  wrap.style.display = '';
+}
+
+// Dropdown onchange — re-validate the same URL with a different creative_index.
+async function onDcPickerChange(){
+  const sel = document.getElementById('dc-picker');
+  if(!sel || !selectedPath) return;
+  const idx = parseInt(sel.value, 10);
+  if(isNaN(idx)) return;
+  await commitPath(selectedPath, idx);
 }
 function setStatus(msg,cls){
   const el=document.getElementById('pstatus');
@@ -5443,20 +5516,22 @@ function getFrames(){
 // ── Run capture ────────────────────────────────────────────────────────────────
 async function runCapture(){
   if(!selectedPath)return;
-  const frames     = getFrames();
-  const wantFrames = document.getElementById('opt-frames').checked;
-  const wantVideo  = document.getElementById('opt-video').checked;
-  const rs         = document.getElementById('runstatus');
+  const frames      = getFrames();
+  const wantFrames  = document.getElementById('opt-frames').checked;
+  const wantIsiPng  = document.getElementById('opt-isi-png').checked;
+  const wantIsiHtml = document.getElementById('opt-isi-html').checked;
+  const wantVideo   = document.getElementById('opt-video').checked;
+  const rs          = document.getElementById('runstatus');
 
-  // Block: PNG frames checked but no frame entries.
+  // Block: Frames is checked but no frame entries.
   if(wantFrames && frames.length === 0){
-    rs.textContent = '⚠ Add at least one frame to export — use "📸 Capture this frame" or "+ Add frame".';
+    rs.textContent = '⚠ Add at least one frame to export — use "📸 Capture this frame" or "+ Add frame", or uncheck Frames.';
     rs.style.color = 'var(--accent-error)';
     return;
   }
   // Block: nothing at all is selected.
-  if(!wantFrames && !wantVideo){
-    rs.textContent = '⚠ Pick at least one export option (PNG frames + ISI, or MP4 video).';
+  if(!wantFrames && !wantIsiPng && !wantIsiHtml && !wantVideo){
+    rs.textContent = '⚠ Pick at least one export option.';
     rs.style.color = 'var(--accent-error)';
     return;
   }
@@ -5472,8 +5547,10 @@ async function runCapture(){
     body: JSON.stringify({
       path:        selectedPath,
       frames:      frames,
-      do_frames:   document.getElementById('opt-frames').checked,
-      do_video:    document.getElementById('opt-video').checked,
+      do_frames:   wantFrames,
+      do_isi_png:  wantIsiPng,
+      do_isi_html: wantIsiHtml,
+      do_video:    wantVideo,
     })
   }, 'Starting capture…');
 
@@ -8228,6 +8305,11 @@ class Handler(BaseHTTPRequestHandler):
         sess = self.sess
         body = self._body()
         raw  = body.get("path", "").strip()
+        # Optional: when re-validating a DoubleClick URL to pick a different
+        # creative size from the dropdown, the frontend sends the same URL
+        # plus `creative_index`. We use the cached discovery (sess.dc_cache)
+        # to avoid re-running the slow Playwright cycle.
+        creative_index = int(body.get("creative_index") or 0)
 
         dc_info = None  # extras to surface in the response if it's a DoubleClick URL
         studio_url = None  # Studio preview URL for the picked creative (DoubleClick only)
@@ -8241,11 +8323,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             html = folder / "index.html"
             is_remote = True
-        # DoubleClick Studio external-preview URL? Pick the first creative.
+        # DoubleClick Studio external-preview URL?
         elif DOUBLECLICK_PREVIEW_RE.match(raw):
             try:
-                with PLAYWRIGHT_SEM:
-                    folder, dc_info = _doubleclick_url_to_local(raw)
+                # Reuse the cached creative list when the user is just
+                # switching size on the same URL — much faster than another
+                # Playwright cycle through the size dropdown.
+                cached = None
+                cache = getattr(sess, "_dc_cache", None) or {}
+                if cache.get("url") == raw:
+                    cached = cache.get("banners")
+                if cached:
+                    folder, dc_info = _doubleclick_url_to_local(
+                        raw, picked_index=creative_index, cached_banners=cached)
+                else:
+                    with PLAYWRIGHT_SEM:
+                        folder, dc_info = _doubleclick_url_to_local(
+                            raw, picked_index=creative_index)
+                    # Cache discovery for subsequent dropdown picks.
+                    sess._dc_cache = {"url": raw,
+                                      "banners": dc_info.get("creatives") or []}
             except Exception as e:
                 self._json({"ok": False, "error": f"Couldn't load DoubleClick preview: {e}"})
                 return
@@ -8295,10 +8392,15 @@ class Handler(BaseHTTPRequestHandler):
         out.mkdir(parents=True, exist_ok=True)
         sess.output_dir = out
 
-        raw_frames = body.get("frames", [])
-        frames     = [(f["name"], float(f["t"])) for f in raw_frames] if raw_frames else DEFAULT_FRAMES
-        do_frames  = body.get("do_frames", True)
-        do_video   = body.get("do_video",  True)
+        raw_frames  = body.get("frames", [])
+        frames      = [(f["name"], float(f["t"])) for f in raw_frames] if raw_frames else DEFAULT_FRAMES
+        do_frames   = body.get("do_frames",   True)
+        do_video    = body.get("do_video",    True)
+        # Independent ISI controls — match the Multi-Banner Viewer's 4-checkbox
+        # layout. Default each to do_frames if not provided so older clients
+        # that only send {do_frames, do_video} still get the original behaviour.
+        do_isi_png  = body.get("do_isi_png",  do_frames)
+        do_isi_html = body.get("do_isi_html", do_frames)
 
         # Capture session reference for the worker thread (self goes out of
         # scope when the request returns).
@@ -8311,6 +8413,8 @@ class Handler(BaseHTTPRequestHandler):
                     asyncio.run(run_all(
                         banner, out, frames, do_frames, do_video,
                         lambda m: _broadcast(captured_sess, {"type":"log","text":m}),
+                        do_isi_png=do_isi_png,
+                        do_isi_html=do_isi_html,
                         studio_url=studio_url,
                     ))
                 # Zip the output for download.
