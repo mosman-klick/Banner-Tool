@@ -5400,7 +5400,14 @@ async function commitPath(p, creativeIndex){
       const wrap = document.getElementById('dc-picker-wrap');
       if(wrap) wrap.style.display = 'none';
       window._dcCreatives = null;
-      if(isRemote) badge = '  — Ziflow';
+      if(isRemote){
+        badge = '  — Ziflow';
+        // Klick proofs are private and only the og:image's banner shows up.
+        // Hint at the bookmarklet so the user can pull in the others.
+        if(/klickhealth\.ziflow\.io\/proof\//i.test(p)){
+          badge += '  · multi-banner? Click the 📌 bookmarklet on this proof to load all sizes.';
+        }
+      }
     }
     setStatus('✓  '+data.name+' ('+data.width+'×'+data.height+')' + badge, 'ok');
     document.getElementById('run-btn').disabled=false;
